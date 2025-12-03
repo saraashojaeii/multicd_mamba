@@ -11,7 +11,6 @@ from monai.utils import UpsampleMode
 from models.mamba_customer import ConvMamba
 
 
-# removed unused get_dwconv_layer
 class ConvPosEnc(nn.Module):
     def __init__(self, dim, k=3):
         super().__init__()
@@ -74,7 +73,6 @@ def get_srcm_layer(
             return nn.Sequential(srcm_layer, nn.MaxPool2d(kernel_size=stride, stride=stride))
     return srcm_layer
 
-# removed DirectionalAGLGF (not needed for segmentation)
 
 class SRCMBlock(nn.Module):
 
@@ -127,8 +125,6 @@ class SRCMBlock(nn.Module):
         x = self.drop(x)
         x = x * self.se(x)
         return identity + self.res_scale * x
-
-# removed multi-branch fusion classes (L_GF, G_GF, AdaptiveGate) for segmentation-only
 
 class CDMamba_seg_cd(nn.Module):
     """
