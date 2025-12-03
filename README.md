@@ -1,40 +1,14 @@
-<div align="center">
-    <h2>
-        CDMamba: Incorporating Local Clues into Mamba for Remote Sensing Image Multi-class Change Detection
-    </h2>
-</div>
-<br>
+# CDMamba: Multi-class Change Detection
 
+Remote sensing image multi-class change detection using Mamba architecture.
 
 ## Installation
 
-### Requirements
+**Requirements:** Python 3.10, PyTorch 2.0+, CUDA 11.7+
 
-- Linux system, Windows is not tested, depending on whether `causal-conv1d` and `mamba-ssm` can be installed
-- Python 3.8+, recommended 3.10
-- PyTorch 2.0 or higher, recommended 2.1.0
-- CUDA 11.7 or higher, recommended 12.1
-
-### Environment Installation
-
-It is recommended to use Miniconda for installation. The following commands will create a virtual environment named `cd_mamba` and install PyTorch. In the following installation steps, the default installed CUDA version is **12.1**. If your CUDA version is not 12.1, please modify it according to the actual situation.
-
-Note: If you are experienced with PyTorch and have already installed it, you can skip to the next section. Otherwise, you can follow the steps below.
-
-<details open>
-
-**Step 0**: Install [Miniconda](https://docs.conda.io/projects/miniconda/en/latest/index.html).
-
-**Step 1**: Create a virtual environment named `cd_mamba` and activate it.
-
-```shell
+```bash
 conda create -n cd_mamba python=3.10
 conda activate cd_mamba
-```
-
-**Step 2**: Install dependencies.
-
-```shell
 pip install -r requirements.txt
 ```
 
@@ -42,89 +16,40 @@ pip install -r requirements.txt
 pip uninstall opencv-python opencv-python-headless opencv-contrib-python -y
 pip install opencv-python-headless==4.8.0.76
 ```
-**Note**: Please refer to https://github.com/hustvl/Vim or https://blog.csdn.net/weixin_45667052/article/details/136311600 when installing mamba.
+**Note:** For `mamba-ssm` installation help, see [Vim repository](https://github.com/hustvl/Vim)
 
+## Dataset Structure
 
-</details>
-
-
-### Install CDMamba
-
-
-You can download or clone the CDMamba repository.
-
-```shell
-git clone git@github.com:saraashojaeii/BuildingCD_mamba_based.git
-cd BuildingCD_mamba_based
-```
-
-## Dataset Organization Method
-
-You can also choose other sources to download the data, but you need to organize the dataset in the following format：
+Organize your dataset as follows:
 
 ```
-${DATASET_ROOT} # Dataset root directory, for example: /home/username/data/LEVIR-CD
-├── A
-│   ├── train_1_1.png
-│   ├── train_1_2.png
-│   ├──...
-│   ├── val_1_1.png
-│   ├── val_1_2.png
-│   ├──...
-│   ├── test_1_1.png
-│   ├── test_1_2.png
-│   └── ...
-├── B
-│   ├── train_1_1.png
-│   ├── train_1_2.png
-│   ├──...
-│   ├── val_1_1.png
-│   ├── val_1_2.png
-│   ├──...
-│   ├── test_1_1.png
-│   ├── test_1_2.png
-│   └── ...
-├── label
-│   ├── train_1_1.png
-│   ├── train_1_2.png
-│   ├──...
-│   ├── val_1_1.png
-│   ├── val_1_2.png
-│   ├──...
-│   ├── test_1_1.png
-│   ├── test_1_2.png
-│   └── ...
-├── list
-│   ├── train.txt
-│   ├── val.txt
-│   └── test.txt
+${DATASET_ROOT}/
+├── A/          # T1 images
+├── B/          # T2 images
+├── label/      # Ground truth labels
+└── list/
+    ├── train.txt
+    ├── val.txt
+    └── test.txt
 ```
-
-
 
 ## Training
 
-Run training with all available CLI args. Most hyperparameters (dataset paths, batch size, epochs, model config) are read from the JSON config.
+### Multi-class Change Detection
 
 ```bash
-python -u train_cd_modified.py \
-  --config config/second_cdmamba/second_cdmamba_modified.json \
+python train_seg_cd.py \
+  --config config/second_cdmamba/cdmamba_seg_cd_multiclass.json \
   --phase train \
-  --model CDMamba \
   --dataset SECOND \
   --tag exp1 \
-  --seed 123 \
-  --max_train_batches 500 \
-  --max_val_batches 100 \
-  --max_test_batches 2 \
-  --change_threshold 0.5
+  --seed 123
 ```
 
-- __--config__: path to the JSON config. Edit dataset roots, batch size, epochs, paths, etc. in this file.
-- __--phase__: set to `train` for training (and validation). Use `test` to run the test loop only.
-- __--model/--dataset/--tag__: optional; used for naming the run folder and WandB run name.
-- __--seed__: optional; accepted for compatibility.
-- __--max_*_batches__: limit batches for quick tests; `0` means no limit.
-- __--change_threshold__: probability threshold for binarizing the change head (class-1).
+**Key Arguments:**
+- `--config`: Path to JSON config file (contains dataset paths, batch size, epochs, model parameters)
+- `--phase`: `train` or `test`
+- `--tag`: Custom experiment name (optional)
+- `--max_train_batches`: Limit training batches for quick tests (0 = no limit)
 
-Results, logs, and checkpoints are written under folders defined in `path_cd` inside the config. The script will create timestamped subfolders per run.
+Results are saved to directories specified in the config file under `path_cd`.

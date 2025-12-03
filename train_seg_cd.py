@@ -203,7 +203,7 @@ def main():
             test_loader = Data.create_cd_dataloader(test_set, dataset_opt, 'test', seed_worker=None, g=None)
             opt['len_test_dataloader'] = len(test_loader)
 
-    # Class weights (optional)
+    # Class weights
     num_classes = int(opt['model']['n_classes'])
     ignore_index = int(opt.get('train', {}).get('ignore_index', 255))
     if train_loader is not None:
@@ -232,7 +232,7 @@ def main():
     trainable_params = sum(p.numel() for p in cd_model.parameters() if p.requires_grad)
     logger.info(f'Total params: {total_params:,} | Trainable: {trainable_params:,} ({100*trainable_params/total_params:.2f}%)')
 
-    # Optional GFLOPs (CUDA + torchinfo)
+    # GFLOPs (CUDA + torchinfo)
     if device.type == 'cuda' and summary is not None:
         try:
             # dual input by default for CD model
@@ -327,7 +327,7 @@ def main():
 
             optimizer.zero_grad(set_to_none=True)
 
-            # running change metrics (averaged over epoch)
+            # running change metrics 
             run_tp = run_fp = run_fn = run_tn = 0
 
             for step, batch in enumerate(tqdm(_train_iter, total=_train_total, desc=f"Train {epoch}/{n_epochs}")):
@@ -409,7 +409,7 @@ def main():
             train_epoch_miou = seg_scores['miou']
             train_epoch_acc = seg_scores['acc']
 
-            # epoch-end: change metrics (averaged)
+            # e-e: change metrics
             if (run_tp + run_fp + run_fn) > 0:
                 chg_f1 = 2 * run_tp / max(2 * run_tp + run_fp + run_fn, 1e-8)
                 chg_iou = run_tp / max(run_tp + run_fp + run_fn, 1e-8)
@@ -530,11 +530,10 @@ def main():
                 else:
                     logger.info(f'No improvement over best mF1={best_mF1:.5f}')
 
-            # always save regular checkpoint
+            # save regular checkpoint
             save_network(opt, epoch, cd_model, optimizer, is_best_model=False)
             scheduler.step()
 
-        # after training, fall through to testing on best if requested
         args.phase = 'test'
 
     # ----------------------------- TEST ----------------------------- #
