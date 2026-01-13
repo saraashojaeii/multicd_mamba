@@ -10,7 +10,7 @@ import torch.utils.data
 
 
 def create_cd_dataloader(dataset, dataset_opt, phase, seed_worker, g):
-    if phase == 'train' or 'val' or 'test':
+    if phase in ('train', 'val', 'test'):
         return torch.utils.data.DataLoader(
             dataset,
             batch_size=dataset_opt['batch_size'],

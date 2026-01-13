@@ -343,7 +343,8 @@ def main():
                     # ----- loss -----
                     if loss_type == 'multi_class_cd':
                         preds = (seg_logits_t1, seg_logits_t2, change_pred)
-                        targets = {'seg_t1': seg_t1, 'seg_t2': seg_t2}
+                        change_bin = derive_change_bin(seg_t1, seg_t2)
+                        targets = {'seg_t1': seg_t1, 'seg_t2': seg_t2, 'change': change_bin}
                         loss, loss_components = loss_fun(preds, targets)
                     elif loss_type == 'extended_triplet':
                         if change_pred is None:
@@ -388,7 +389,7 @@ def main():
                         if change_pred.size(1) == 2:
                             chg_mask = torch.argmax(change_pred, dim=1)
                         else:
-                            chg_mask = (torch.sigmoid(change_pred[:, 0]) > 0.5).long()
+                            chg_mask = (torch.sigmoid(change_pred[:, 0]) > args.change_threshold).long()
                         gt_bin = derive_change_bin(seg_t1, seg_t2)
                         pr_np, gt_np = chg_mask.cpu().numpy(), gt_bin.cpu().numpy()
                         tp = np.logical_and(pr_np == 1, gt_np == 1).sum()
@@ -455,7 +456,7 @@ def main():
 
                         # loss
                         if loss_type == 'multi_class_cd':
-                            v_loss, _ = loss_fun((v_seg1, v_seg2, v_change), {'seg_t1': y1, 'seg_t2': y2})
+                            v_loss, _ = loss_fun((v_seg1, v_seg2, v_change), {'seg_t1': y1, 'seg_t2': y2, 'change': derive_change_bin(y1, y2)})
                         elif loss_type == 'extended_triplet':
                             v_change_1ch = v_change[:, 1:2] if (v_change is not None and v_change.size(1) == 2) else (v_change if v_change is not None else torch.zeros((v_seg1.size(0), 1, v_seg1.size(2), v_seg1.size(3)), device=v_seg1.device))
                             v_loss, _ = loss_fun((v_seg1, v_seg2, v_change_1ch), {'seg_t1': y1, 'seg_t2': y2, 'change': derive_change_bin(y1, y2)})
@@ -480,7 +481,7 @@ def main():
                             if v_change.size(1) == 2:
                                 chg_mask = torch.argmax(v_change, dim=1)
                             else:
-                                chg_mask = (torch.sigmoid(v_change[:, 0]) > 0.5).long()
+                                chg_mask = (torch.sigmoid(v_change[:, 0]) > args.change_threshold).long()
                             gt = derive_change_bin(y1, y2)
                             pr_np, gt_np = chg_mask.cpu().numpy(), gt.cpu().numpy()
                             tp = np.logical_and(pr_np == 1, gt_np == 1).sum()
@@ -572,7 +573,7 @@ def main():
                     if chg.size(1) == 2:
                         cmask = torch.argmax(chg, dim=1)
                     else:
-                        cmask = (torch.sigmoid(chg[:, 0]) > 0.5).long()
+                        cmask = (torch.sigmoid(chg[:, 0]) > args.change_threshold).long()
                     gt = derive_change_bin(y1, y2)
                     pr_np, gt_np = cmask.cpu().numpy(), gt.cpu().numpy()
                     tp = np.logical_and(pr_np == 1, gt_np == 1).sum()
