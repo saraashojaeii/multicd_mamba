@@ -53,3 +53,9 @@ python train_seg_cd.py \
 - `--max_train_batches`: Limit training batches for quick tests (0 = no limit)
 
 Results are saved to directories specified in the config file under `path_cd`.
+
+## Where outputs go
+
+- Logs, tensorboard/WANDB: under `path_cd.log/<exp_folder>`.
+- Checkpoints: `path_cd.checkpoint/<exp_folder>/best_net.pth` and epoch checkpoints (via `misc.torchutils.save_network`).
+- Results: `path_cd.result/<exp_folder>/test`.
