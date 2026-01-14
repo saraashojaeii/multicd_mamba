@@ -19,6 +19,31 @@ class ConvPosEnc(nn.Module):
     def forward(self, x):  # x: [B,C,H,W]
         return x + self.proj(x)
 
+class CrossTemporalFusion(nn.Module):
+    """
+    Multi-scale feature differencing fusion:
+    concat(F1, F2, |F2-F1|, F2-F1) -> 1x1 conv reduce -> 3x3 conv refine.
+    Output channels match input feature channels (C).
+    """
+    def __init__(self, channels: int):
+        super().__init__()
+        in_ch = channels * 4  # concat 4 feature maps
+        self.fuse = nn.Sequential(
+            nn.Conv2d(in_ch, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, f1: torch.Tensor, f2: torch.Tensor) -> torch.Tensor:
+        """Fuse T1 and T2 features at a given scale."""
+        diff = f2 - f1
+        adiff = torch.abs(diff)
+        x = torch.cat([f1, f2, adiff, diff], dim=1)
+        return self.fuse(x)
+
 class ModifiedSRCMLayer(nn.Module):
     def __init__(self, input_dim, output_dim, d_state=16, d_conv=4, expand=2, groups=4):
         super().__init__()
@@ -179,6 +204,8 @@ class CDMamba_seg_cd(nn.Module):
         self.srcm_decoder_layers, self.up_samples = self._make_srcm_decoder_layers()
         self.srcm_decoder_layers_seg_t1, self.up_samples_seg_t1 = self._make_srcm_decoder_layers()
         self.srcm_decoder_layers_seg_t2, self.up_samples_seg_t2 = self._make_srcm_decoder_layers()
+        # Dedicated change decoder operating on fused multi-scale features
+        self.srcm_decoder_layers_change, self.up_samples_change = self._make_srcm_decoder_layers()
 
         # ---- Bottleneck context (ASPP-lite / dilated conv stack) ----
         bottleneck_channels = init_filters * (2 ** (len(blocks_down) - 1))  # e.g., 16 * 2**3 = 128 with your defaults
@@ -207,6 +234,14 @@ class CDMamba_seg_cd(nn.Module):
             self.act_mod,
         )
 
+        # Cross-temporal fusion modules: one per encoder scale
+        # Encoder produces channels: init_filters * 2**i for i in [0..len(blocks_down)-1]
+        self.fuse_scales = nn.ModuleList([
+            CrossTemporalFusion(init_filters * (2 ** i)) for i in range(len(blocks_down))
+        ])
+        # Fusion at bottleneck level
+        self.fuse_bottleneck = CrossTemporalFusion(bottleneck_channels)
+
         # --- SEGMENTATION HEADS ---
         # Each head outputs num_classes channels
         self.seg_head_t1 = nn.Sequential(
@@ -222,10 +257,11 @@ class CDMamba_seg_cd(nn.Module):
         
         if self.use_change_head:
             # Output 2 channels: [no-change, change]
+            # Now expects features from the dedicated change decoder (C = init_filters)
             self.change_head = nn.Sequential(
-                get_norm_layer(name=self.norm, spatial_dims=self.spatial_dims, channels=self.init_filters * 2),
+                get_norm_layer(name=self.norm, spatial_dims=self.spatial_dims, channels=self.init_filters),
                 self.act_mod,
-                get_conv_layer(self.spatial_dims, self.init_filters * 2, 2, kernel_size=1, bias=True),
+                get_conv_layer(self.spatial_dims, self.init_filters, 2, kernel_size=1, bias=True),
             )
 
         if dropout_prob is not None:
@@ -340,14 +376,15 @@ class CDMamba_seg_cd(nn.Module):
             x1_latent = self.context(x1_latent)
             x2_latent = self.context(x2_latent)
             
-            # Calculate differences for change detection
-            down_x = []
+            # Cross-temporal fusion at each encoder scale (multi-scale differencing)
+            down_x_fused = []
             for i in range(len(down_x1)):
                 x1_i, x2_i = down_x1[i], down_x2[i]
-                down_x.append(torch.abs(x1_i - x2_i))
+                fused_i = self.fuse_scales[i](x1_i, x2_i)
+                down_x_fused.append(fused_i)
             
             # Decode each path
-            down_x.reverse()
+            down_x_fused.reverse()
             down_x1.reverse()
             down_x2.reverse()
             
@@ -359,8 +396,10 @@ class CDMamba_seg_cd(nn.Module):
             seg_logits_t2 = self.seg_head_t2(seg2)
             
             if self.use_change_head:
-                # Concatenate features for change head
-                change_logits = self.change_head(torch.cat([seg1, seg2], dim=1))
+                # Fuse bottleneck and decode dedicated change path
+                fused_latent = self.fuse_bottleneck(x1_latent, x2_latent)
+                chg_dec = self._decode_with_layers(fused_latent, down_x_fused, self.up_samples_change, self.srcm_decoder_layers_change)
+                change_logits = self.change_head(chg_dec)
                 return seg_logits_t1, seg_logits_t2, change_logits
             else:
                 return seg_logits_t1, seg_logits_t2
