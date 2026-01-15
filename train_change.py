@@ -144,7 +144,7 @@ def main():
     logger.info("Creating datasets...")
     for phase in ['train', 'val', 'test']:
         if phase in opt['datasets']:
-            dataset = Data.create_cd_dataset(opt['datasets'][phase], phase)
+            dataset = Data.create_scd_dataset(opt['datasets'][phase], phase)
             logger.info(f'{phase} dataset length: {len(dataset)}')
             if phase == 'train':
                 train_dataset = dataset
