@@ -176,7 +176,8 @@ class Mamba(nn.Module):
         D = torch.ones(d_in, device=x.device)
         
         x_dbl = self.x_proj(x)
-        (delta, B) = x_dbl.split(split_size=[n, n], dim=-1)
+        # x_dbl has shape [..., d_state * 2], split into two d_state parts
+        (delta, B) = x_dbl.split(split_size=[self.d_state, self.d_state], dim=-1)
         delta = F.softplus(self.dt_proj(delta))
         
         # Simplified SSM computation
