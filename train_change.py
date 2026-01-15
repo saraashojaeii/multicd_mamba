@@ -123,8 +123,12 @@ def main():
     make_stamped_dirs(opt, exp_folder)
 
     # Logger
-    log_file = os.path.join(opt['path_cd']['log'], 'train.log') if args.phase == 'train' else os.path.join(opt['path_cd']['log'], 'test.log')
-    logger = setup_logger('base', log_file, 'INFO', screen=True, tofile=True)
+    if args.phase == 'train':
+        setup_logger(logger_name=None, root=opt['path_cd']['log'], phase='train', level=logging.INFO, screen=True)
+        setup_logger(logger_name='test', root=opt['path_cd']['log'], phase='test', level=logging.INFO)
+    else:
+        setup_logger(logger_name='test', root=opt['path_cd']['log'], phase='test', level=logging.INFO, screen=True)
+    logger = logging.getLogger('base')
     logger.info(dict2str(opt))
 
     # W&B
