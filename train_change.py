@@ -107,7 +107,7 @@ def main():
     args = parser.parse_args()
 
     # Parse config
-    opt = parse_cfg(args.config)
+    opt = parse_cfg(args)
     opt = dict_to_nonedict(opt)
 
     # GPU setup
