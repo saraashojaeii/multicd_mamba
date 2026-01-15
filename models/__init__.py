@@ -46,6 +46,19 @@ def create_CD_model(opt):
             blocks_up=opt['model']['blocks_up'],
             up_conv_mode=opt['model']['up_conv_mode'],
         )
+    elif model_name in ['cdmamba_change', 'CDMamba_change']:
+        from models.CDMamba_change import CDMamba_change as cdmamba_change
+        cd_model = cdmamba_change(
+            spatial_dims=opt['model']['spatial_dims'],
+            in_channels=opt['model']['in_channels'],
+            init_filters=opt['model']['init_filters'],
+            num_classes=opt['model'].get('n_classes', 2),  # Default to binary change
+            conv_mode=opt['model']['conv_mode'],
+            norm=opt['model']['norm'],
+            blocks_down=opt['model']['blocks_down'],
+            blocks_up=opt['model']['blocks_up'],
+            up_conv_mode=opt['model']['up_conv_mode'],
+        )
     elif model_name == 'bifa':
         from models.bifa import BiFA as bifa
         cd_model = bifa(backbone="mit_b0")
