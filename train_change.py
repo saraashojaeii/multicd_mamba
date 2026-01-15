@@ -162,13 +162,16 @@ def main():
 
     # W&B
     use_wandb = bool(args.wandb_project or opt.get('wandb', {}).get('project', ''))
+    logger.info(f"W&B check: args.wandb_project={args.wandb_project}, config_project={opt.get('wandb', {}).get('project', '')}, use_wandb={use_wandb}")
     if use_wandb and args.phase == 'train':
         wandb.init(
             project=args.wandb_project or opt['wandb']['project'],
             name=exp_folder,
             config=opt
         )
-        logger.info(f"W&B initialized: project={wandb.run.project}, name={wandb.run.name}")
+        logger.info(f"✓ W&B initialized: project={wandb.run.project}, name={wandb.run.name}, run_id={wandb.run.id}")
+    else:
+        logger.info(f"✗ W&B not initialized (use_wandb={use_wandb}, phase={args.phase})")
 
     # ----------------------------- data ----------------------------- #
     logger.info("Creating datasets...")
@@ -348,14 +351,19 @@ def main():
                                 f"Change - Prec: {prec:.4f}, Rec: {rec:.4f}, F1: {f1:.4f}, IoU: {iou:.4f}")
 
                     if use_wandb and wandb.run is not None:
-                        wandb.log({
+                        metrics = {
                             'train/loss': avg_loss,
                             'train/change_prec': prec,
                             'train/change_rec': rec,
                             'train/change_f1': f1,
                             'train/change_iou': iou,
                             'train/lr': optimizer.param_groups[0]['lr']
-                        }, step=global_step)
+                        }
+                        wandb.log(metrics, step=global_step)
+                        if step + 1 == train_print_iter:  # Log once at first print
+                            logger.info(f"✓ Logged to W&B: {list(metrics.keys())}")
+                    elif step + 1 == train_print_iter:
+                        logger.warning(f"✗ W&B logging skipped: use_wandb={use_wandb}, wandb.run={wandb.run}")
 
             # Epoch summary
             avg_train_loss = train_loss_sum / train_batches
