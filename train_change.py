@@ -336,7 +336,7 @@ def main():
                 train_batches += 1
 
                 # Log first batch images to wandb
-                if step == 0 and use_wandb and wandb.run is not None:
+                if step == 0 and use_wandb:
                     log_first_batch_to_wandb("train", batch, seg_t1, seg_t2, change_pred)
 
                 # Logging
@@ -350,7 +350,7 @@ def main():
                     logger.info(f"[Epoch {epoch}/{n_epochs}] Step {step+1}/{_train_total} | Loss: {avg_loss:.4f} | "
                                 f"Change - Prec: {prec:.4f}, Rec: {rec:.4f}, F1: {f1:.4f}, IoU: {iou:.4f}")
 
-                    if use_wandb and wandb.run is not None:
+                    if use_wandb:
                         metrics = {
                             'train/loss': avg_loss,
                             'train/change_prec': prec,
@@ -363,7 +363,7 @@ def main():
                         if step + 1 == train_print_iter:  # Log once at first print
                             logger.info(f"✓ Logged to W&B: {list(metrics.keys())}")
                     elif step + 1 == train_print_iter:
-                        logger.warning(f"✗ W&B logging skipped: use_wandb={use_wandb}, wandb.run={wandb.run}")
+                        logger.warning(f"✗ W&B logging skipped: use_wandb={use_wandb}")
 
             # Epoch summary
             avg_train_loss = train_loss_sum / train_batches
@@ -375,6 +375,18 @@ def main():
             logger.info(f"\n[Epoch {epoch}/{n_epochs}] Train Summary:")
             logger.info(f"  Loss: {avg_train_loss:.4f}")
             logger.info(f"  Change - Prec: {train_prec:.4f}, Rec: {train_rec:.4f}, F1: {train_f1:.4f}, IoU: {train_iou:.4f}\n")
+
+            # Log epoch summary to W&B
+            if use_wandb:
+                wandb.log({
+                    'train/epoch_loss': avg_train_loss,
+                    'train/epoch_prec': train_prec,
+                    'train/epoch_rec': train_rec,
+                    'train/epoch_f1': train_f1,
+                    'train/epoch_iou': train_iou,
+                    'epoch': epoch
+                }, step=global_step)
+                logger.info(f"✓ Logged train epoch summary to W&B")
 
             # ----------------------------- validation ----------------------------- #
             if epoch % val_freq == 0:
@@ -418,7 +430,7 @@ def main():
                         v_tp += tp; v_fp += fp; v_fn += fn; v_tn += tn
 
                         # Log first batch images to wandb
-                        if vstep == 0 and use_wandb and wandb.run is not None:
+                        if vstep == 0 and use_wandb:
                             log_first_batch_to_wandb("val", vbatch, y1, y2, v_change)
 
                 avg_val_loss = v_loss_sum / v_batches
@@ -431,7 +443,7 @@ def main():
                 logger.info(f"  Loss: {avg_val_loss:.4f}")
                 logger.info(f"  Change - Prec: {val_prec:.4f}, Rec: {val_rec:.4f}, F1: {val_f1:.4f}, IoU: {val_iou:.4f}\n")
 
-                if use_wandb and wandb.run is not None:
+                if use_wandb:
                     wandb.log({
                         'val/loss': avg_val_loss,
                         'val/change_prec': val_prec,
@@ -440,6 +452,7 @@ def main():
                         'val/change_iou': val_iou,
                         'epoch': epoch
                     }, step=global_step)
+                    logger.info(f"✓ Logged validation metrics to W&B")
 
                 # Save best model
                 if val_f1 > best_val_f1:
