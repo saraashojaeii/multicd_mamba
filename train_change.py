@@ -161,13 +161,14 @@ def main():
     logger.info(dict2str(opt))
 
     # W&B
-    use_wandb = (args.wandb_project or opt.get('wandb', {}).get('project', ''))
+    use_wandb = bool(args.wandb_project or opt.get('wandb', {}).get('project', ''))
     if use_wandb and args.phase == 'train':
         wandb.init(
             project=args.wandb_project or opt['wandb']['project'],
             name=exp_folder,
             config=opt
         )
+        logger.info(f"W&B initialized: project={wandb.run.project}, name={wandb.run.name}")
 
     # ----------------------------- data ----------------------------- #
     logger.info("Creating datasets...")
@@ -332,7 +333,7 @@ def main():
                 train_batches += 1
 
                 # Log first batch images to wandb
-                if step == 0 and use_wandb:
+                if step == 0 and use_wandb and wandb.run is not None:
                     log_first_batch_to_wandb("train", batch, seg_t1, seg_t2, change_pred)
 
                 # Logging
@@ -346,7 +347,7 @@ def main():
                     logger.info(f"[Epoch {epoch}/{n_epochs}] Step {step+1}/{_train_total} | Loss: {avg_loss:.4f} | "
                                 f"Change - Prec: {prec:.4f}, Rec: {rec:.4f}, F1: {f1:.4f}, IoU: {iou:.4f}")
 
-                    if use_wandb:
+                    if use_wandb and wandb.run is not None:
                         wandb.log({
                             'train/loss': avg_loss,
                             'train/change_prec': prec,
@@ -409,7 +410,7 @@ def main():
                         v_tp += tp; v_fp += fp; v_fn += fn; v_tn += tn
 
                         # Log first batch images to wandb
-                        if vstep == 0 and use_wandb:
+                        if vstep == 0 and use_wandb and wandb.run is not None:
                             log_first_batch_to_wandb("val", vbatch, y1, y2, v_change)
 
                 avg_val_loss = v_loss_sum / v_batches
@@ -422,7 +423,7 @@ def main():
                 logger.info(f"  Loss: {avg_val_loss:.4f}")
                 logger.info(f"  Change - Prec: {val_prec:.4f}, Rec: {val_rec:.4f}, F1: {val_f1:.4f}, IoU: {val_iou:.4f}\n")
 
-                if use_wandb:
+                if use_wandb and wandb.run is not None:
                     wandb.log({
                         'val/loss': avg_val_loss,
                         'val/change_prec': val_prec,
