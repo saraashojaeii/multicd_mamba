@@ -75,18 +75,47 @@ def safe_to_numpy_uint8(x: torch.Tensor) -> np.ndarray:
     return np.squeeze(arr)
 
 
-def log_wandb_images(imgs_dict: dict, step: int, prefix: str = ""):
-    """Log images to W&B."""
+def log_first_batch_to_wandb(prefix, batch, seg_t1, seg_t2, change_pred):
+    """Log first batch images to W&B for change-only model."""
     if wandb.run is None:
         return
-    wandb_imgs = {}
-    for k, v in imgs_dict.items():
-        if isinstance(v, torch.Tensor):
-            v = v.detach().cpu().numpy()
-        if v.ndim == 3:  # [C, H, W]
-            v = v.transpose(1, 2, 0)  # [H, W, C]
-        wandb_imgs[f"{prefix}{k}"] = wandb.Image(v)
-    wandb.log(wandb_imgs, step=step)
+    
+    def _norm(img):
+        """Normalize image tensor to [0, 255] uint8 for visualization."""
+        img = img.detach().cpu()
+        if img.min() < 0: 
+            img = (img + 1.0) / 2.0  # From [-1, 1] to [0, 1]
+        img = (img * 255.0).clamp(0, 255).byte()
+        return img.permute(1, 2, 0).numpy()
+    
+    # Get first sample from batch
+    A0 = batch['A'][0]  # T1 image
+    B0 = batch['B'][0]  # T2 image
+    
+    # Ground truth change (derived from segmentation labels)
+    chg_gt = derive_change_bin(seg_t1, seg_t2)[0].cpu().numpy() * 255
+    
+    # Predicted change
+    if change_pred.size(1) == 2:
+        # 2-class output: [no-change, change]
+        change_probs = torch.softmax(change_pred[0], dim=0)[1].detach().cpu().numpy() * 255
+        change_mask = torch.argmax(change_pred[0], dim=0).detach().cpu().numpy() * 255
+    else:
+        # Single-channel sigmoid output
+        p = torch.sigmoid(change_pred[0, 0]).detach().cpu().numpy()
+        change_probs = (p * 255)
+        change_mask = ((p > 0.5).astype(np.uint8) * 255)
+    
+    # Log to wandb
+    d = {
+        f"{prefix}/input_T1": [wandb.Image(_norm(A0))],
+        f"{prefix}/input_T2": [wandb.Image(_norm(B0))],
+        f"{prefix}/gt_change": [wandb.Image(chg_gt)],
+        f"{prefix}/pred_change_prob": [wandb.Image(change_probs)],
+        f"{prefix}/pred_change_mask": [wandb.Image(change_mask)],
+    }
+    
+    wandb.log(d)
 
 
 # ----------------------------- main ----------------------------- #
@@ -302,6 +331,10 @@ def main():
                 train_loss_sum += float(loss.item())
                 train_batches += 1
 
+                # Log first batch images to wandb
+                if step == 0 and use_wandb:
+                    log_first_batch_to_wandb("train", batch, seg_t1, seg_t2, change_pred)
+
                 # Logging
                 if (step + 1) % train_print_iter == 0:
                     avg_loss = train_loss_sum / train_batches
@@ -375,6 +408,10 @@ def main():
 
                         v_tp += tp; v_fp += fp; v_fn += fn; v_tn += tn
 
+                        # Log first batch images to wandb
+                        if vstep == 0 and use_wandb:
+                            log_first_batch_to_wandb("val", vbatch, y1, y2, v_change)
+
                 avg_val_loss = v_loss_sum / v_batches
                 val_prec = v_tp / (v_tp + v_fp + 1e-8)
                 val_rec = v_tp / (v_tp + v_fn + 1e-8)
@@ -398,14 +435,12 @@ def main():
                 # Save best model
                 if val_f1 > best_val_f1:
                     best_val_f1 = val_f1
-                    save_path = os.path.join(opt['path_cd']['checkpoint'], 'best_net.pth')
-                    save_network(cd_model, save_path)
-                    logger.info(f"✓ Saved best model (F1: {best_val_f1:.4f}) to {save_path}")
+                    save_network(opt, epoch, cd_model, optimizer, is_best_model=True)
+                    logger.info(f"✓ Saved best model (F1: {best_val_f1:.4f})")
 
             # Save epoch checkpoint
             if epoch % 10 == 0:
-                save_path = os.path.join(opt['path_cd']['checkpoint'], f'epoch_{epoch}.pth')
-                save_network(cd_model, save_path)
+                save_network(opt, epoch, cd_model, optimizer, is_best_model=False)
 
             # Step scheduler
             if scheduler is not None:

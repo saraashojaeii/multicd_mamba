@@ -338,7 +338,7 @@ change_mask = (change_prob > 0.3).long()  # Lower threshold for higher recall
 ---
 
 ## Example Training Command (Full)
-
+python train_change.py --config config/second_cdmamba/cdmamba_change_only.json --phase train --dataset SECOND --tag change_only_fusion_v1 --seed 123
 ```bash
 python train_change.py \
   --config config/second_cdmamba/cdmamba_change_only.json \
