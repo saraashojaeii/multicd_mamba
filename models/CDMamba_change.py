@@ -12,6 +12,7 @@ from monai.networks.layers.factories import Act, Norm
 from monai.networks.layers.utils import get_act_layer, get_norm_layer
 from monai.utils import UpsampleMode
 from monai.networks.layers import Dropout
+from models.mamba_customer import ConvMamba
 
 
 class ConvPosEnc(nn.Module):
@@ -57,12 +58,7 @@ class ModifiedSRCMLayer(nn.Module):
 
         # Grouped ConvMamba (split channels across groups)
         self.mambas = nn.ModuleList([
-            Mamba(
-                d_model=input_dim // groups,
-                d_state=d_state,
-                d_conv=d_conv,
-                expand=expand,
-            )
+            ConvMamba(d_model=input_dim // groups, d_state=d_state, d_conv=d_conv, expand=expand, bimamba_type="v2")
             for _ in range(groups)
         ])
 
@@ -130,60 +126,6 @@ class SRCMBlock(nn.Module):
         # Residual
         out = out + identity
         return out
-
-
-# Minimal Mamba implementation for this model
-class Mamba(nn.Module):
-    def __init__(self, d_model, d_state=16, d_conv=4, expand=2):
-        super().__init__()
-        self.d_model = d_model
-        self.d_state = d_state
-        self.d_conv = d_conv
-        self.expand = expand
-        self.d_inner = int(self.expand * self.d_model)
-        
-        self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=False)
-        self.conv1d = nn.Conv1d(
-            in_channels=self.d_inner,
-            out_channels=self.d_inner,
-            bias=True,
-            kernel_size=d_conv,
-            groups=self.d_inner,
-            padding=d_conv - 1,
-        )
-        self.x_proj = nn.Linear(self.d_inner, self.d_state * 2, bias=False)
-        self.dt_proj = nn.Linear(self.d_state, self.d_inner, bias=True)
-        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=False)
-
-    def forward(self, x):
-        (b, l, d) = x.shape
-        x_and_res = self.in_proj(x)
-        (x, res) = x_and_res.split(split_size=[self.d_inner, self.d_inner], dim=-1)
-        
-        x = x.transpose(1, 2)
-        x = self.conv1d(x)[:, :, :l]
-        x = x.transpose(1, 2)
-        
-        x = F.silu(x)
-        y = self.ssm(x)
-        y = y * F.silu(res)
-        output = self.out_proj(y)
-        return output
-
-    def ssm(self, x):
-        (d_in, n) = self.x_proj.weight.shape
-        A = -torch.exp(torch.randn(d_in, n, device=x.device))
-        D = torch.ones(d_in, device=x.device)
-        
-        x_dbl = self.x_proj(x)
-        # x_dbl has shape [..., d_state * 2], split into two d_state parts
-        (delta, B) = x_dbl.split(split_size=[self.d_state, self.d_state], dim=-1)
-        delta = F.softplus(self.dt_proj(delta))
-        
-        # Simplified SSM computation
-        y = x * delta @ B.transpose(-1, -2)
-        y = y + x * D.unsqueeze(0).unsqueeze(0)
-        return y
 
 
 class CDMamba_change(nn.Module):
