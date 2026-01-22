@@ -499,25 +499,45 @@ def main():
                 val_miou = val_scores['miou']
                 val_acc = val_scores['acc']
 
+                # Change detection metrics
                 if (v_tp + v_fp + v_fn) > 0:
+                    v_chg_prec = v_tp / max(v_tp + v_fp, 1e-8)
+                    v_chg_rec = v_tp / max(v_tp + v_fn, 1e-8)
                     v_chg_f1 = 2 * v_tp / max(2 * v_tp + v_fp + v_fn, 1e-8)
                     v_chg_iou = v_tp / max(v_tp + v_fp + v_fn, 1e-8)
                     v_chg_acc = (v_tp + v_tn) / max(v_tp + v_tn + v_fp + v_fn, 1e-8)
                 else:
-                    v_chg_f1 = v_chg_iou = v_chg_acc = 0.0
+                    v_chg_prec = v_chg_rec = v_chg_f1 = v_chg_iou = v_chg_acc = 0.0
 
                 val_loss_avg = v_loss_sum / max(1, v_batches)
-                wandb.log({
+                
+                # Comprehensive W&B logging
+                wandb_metrics = {
                     'val/epoch_loss': val_loss_avg,
                     'val/epoch_mF1': val_mf1,
                     'val/epoch_mIoU': val_miou,
                     'val/epoch_OA': val_acc,
+                    'val/epoch_change_prec': v_chg_prec,
+                    'val/epoch_change_rec': v_chg_rec,
                     'val/epoch_change_f1': v_chg_f1,
                     'val/epoch_change_iou': v_chg_iou,
                     'val/epoch_change_acc': v_chg_acc,
                     'epoch': epoch
-                })
-                logger.info(f"[Val] ep {epoch} loss {val_loss_avg:.5f} | seg mF1 {val_mf1:.4f} | chg F1 {v_chg_f1:.4f}")
+                }
+                
+                # Add per-class F1 and IoU if available
+                if 'f1_per_class' in val_scores:
+                    for cls_idx, f1_val in enumerate(val_scores['f1_per_class']):
+                        wandb_metrics[f'val/class_{cls_idx}_f1'] = f1_val
+                if 'iou_per_class' in val_scores:
+                    for cls_idx, iou_val in enumerate(val_scores['iou_per_class']):
+                        wandb_metrics[f'val/class_{cls_idx}_iou'] = iou_val
+                
+                wandb.log(wandb_metrics)
+                
+                logger.info(f"[Val] ep {epoch} loss {val_loss_avg:.5f} | seg mF1 {val_mf1:.4f} mIoU {val_miou:.4f} | "
+                           f"chg Prec {v_chg_prec:.4f} Rec {v_chg_rec:.4f} F1 {v_chg_f1:.4f} IoU {v_chg_iou:.4f}")
+                logger.info(f"✓ Logged {len(wandb_metrics)} validation metrics to W&B")
 
                 # Save best model by seg mF1
                 if val_mf1 > best_mF1:
