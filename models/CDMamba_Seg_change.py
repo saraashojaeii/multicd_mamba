@@ -10,6 +10,33 @@ from monai.networks.layers.utils import get_act_layer, get_norm_layer
 from monai.utils import UpsampleMode
 from models.mamba_customer import ConvMamba
 
+class ContextBlock2D(nn.Module):
+    def __init__(self, ch, norm_layer, act):
+        super().__init__()
+        self.local = nn.Sequential(
+            nn.Conv2d(ch, ch, 3, padding=1, dilation=1, bias=False),
+            norm_layer(ch),
+            act,
+            nn.Conv2d(ch, ch, 3, padding=2, dilation=2, bias=False),
+            norm_layer(ch),
+            act,
+        )
+        self.global_branch = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(ch, ch, 1, bias=False),
+            act,
+        )
+        self.fuse = nn.Sequential(
+            nn.Conv2d(ch * 2, ch, 1, bias=False),
+            norm_layer(ch),
+            act,
+        )
+
+    def forward(self, x):
+        loc = self.local(x)                            # [B, C, H, W]
+        glob = self.global_branch(x)                   # [B, C, 1, 1]
+        glob = F.interpolate(glob, size=x.shape[2:], mode="bilinear", align_corners=False)
+        return self.fuse(torch.cat([loc, glob], dim=1))
 
 class ConvPosEnc(nn.Module):
     def __init__(self, dim, k=3):
@@ -60,7 +87,7 @@ class ModifiedSRCMLayer(nn.Module):
 
         self.gate_proj = nn.Linear(input_dim, input_dim)
         self.pos_enc = ConvPosEnc(input_dim)
-        self.pos_embed = nn.Parameter(torch.randn(1, 4096, input_dim))  # Max 32x32 tokens (safe default)
+        self.pos_embed = nn.Parameter(torch.randn(1, 4096, input_dim))  # Max 64x64 tokens (safe default)
         self.proj = nn.Linear(input_dim, output_dim)
 
     def forward(self, x):
@@ -209,30 +236,12 @@ class CDMamba_seg_cd(nn.Module):
 
         # ---- Bottleneck context (ASPP-lite / dilated conv stack) ----
         bottleneck_channels = init_filters * (2 ** (len(blocks_down) - 1))  # e.g., 16 * 2**3 = 128 with your defaults
-
-        if spatial_dims == 2:
-            Conv = nn.Conv2d
-            Pool = nn.AdaptiveAvgPool2d
-        elif spatial_dims == 3:
-            Conv = nn.Conv3d
-            Pool = nn.AdaptiveAvgPool3d
+ 
+        if self.spatial_dims == 2:
+            norm_fn = lambda c: get_norm_layer(name=self.norm, spatial_dims=2, channels=c)
+            self.context = ContextBlock2D(bottleneck_channels, norm_fn, self.act_mod)
         else:
-            raise ValueError("`spatial_dims` can only be 2 or 3.")
-
-        self.context = nn.Sequential(
-            Conv(bottleneck_channels, bottleneck_channels, kernel_size=3, padding=1, dilation=1, bias=False),
-            get_norm_layer(name=self.norm, spatial_dims=self.spatial_dims, channels=bottleneck_channels),
-            self.act_mod,
-
-            Conv(bottleneck_channels, bottleneck_channels, kernel_size=3, padding=2, dilation=2, bias=False),
-            get_norm_layer(name=self.norm, spatial_dims=self.spatial_dims, channels=bottleneck_channels),
-            self.act_mod,
-
-            # optional: tiny global context leg (helps large roofs)
-            Pool(1),
-            Conv(bottleneck_channels, bottleneck_channels, kernel_size=1, bias=False),
-            self.act_mod,
-        )
+            self.context = nn.Identity()  # or implement ContextBlock3D
 
         # Cross-temporal fusion modules: one per encoder scale
         # Encoder produces channels: init_filters * 2**i for i in [0..len(blocks_down)-1]
@@ -328,17 +337,37 @@ class CDMamba_seg_cd(nn.Module):
 
         return x, down_x
 
-    def _decode_with_layers(self, x: torch.Tensor, down_x: list[torch.Tensor],
-                             up_samples: nn.ModuleList, decoder_layers: nn.ModuleList) -> torch.Tensor:
-        """Generic decoder that operates on provided up-sample and decoder layer lists."""
+    def _decode_with_layers(
+        self,
+        x: torch.Tensor,
+        down_x: list[torch.Tensor],
+        up_samples: nn.ModuleList,
+        decoder_layers: nn.ModuleList,
+    ) -> torch.Tensor:
+        """
+        down_x is expected to be reversed before calling this:
+        down_x[0] = bottleneck feature (same scale as x)
+        down_x[1:] = skip features from deep -> shallow
+        """
+        skips = down_x[1:]  # exclude bottleneck
+
+        interp_mode = "bilinear" if self.spatial_dims == 2 else "trilinear"
+
         for i, (up, upl) in enumerate(zip(up_samples, decoder_layers)):
             x_up = up(x)
-            target = down_x[i + 1]
+            target = skips[i]
+
             if x_up.shape[2:] != target.shape[2:]:
-                x_up = F.interpolate(x_up, size=target.shape[2:], mode='bilinear', align_corners=False)
-            x = torch.cat([x_up, target], dim=1)  # <-- concat
+                x_up = F.interpolate(
+                    x_up, size=target.shape[2:], mode=interp_mode, align_corners=False
+                )
+
+            x = torch.cat([x_up, target], dim=1)
             x = upl(x)
+
         return x
+
+
 
     def decode(self, x: torch.Tensor, down_x: list[torch.Tensor]) -> torch.Tensor:
         return self._decode_with_layers(x, down_x, self.up_samples, self.srcm_decoder_layers)
