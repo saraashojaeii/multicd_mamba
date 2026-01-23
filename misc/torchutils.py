@@ -80,7 +80,7 @@ def save_network(opt, epoch, cd_model, optimizer, is_best_model=False ):
     state_dict = network.state_dict()
     for key, param in state_dict.items():
         state_dict[key] = param.cpu()
-    # torch.save(state_dict, cd_gen_path)
+    torch.save(state_dict, cd_gen_path)
     if is_best_model:
         torch.save(state_dict, best_cd_gen_path)
 
@@ -89,7 +89,7 @@ def save_network(opt, epoch, cd_model, optimizer, is_best_model=False ):
                  'scheduler': None,
                  'optimizer': None}
     opt_state['optimizer'] = optimizer.state_dict()
-    # torch.save(opt_state, cd_opt_path)
+    torch.save(opt_state, cd_opt_path)
     if is_best_model:
         torch.save(opt_state, best_cd_opt_path)
 

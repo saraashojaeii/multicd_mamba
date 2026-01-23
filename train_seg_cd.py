@@ -155,17 +155,22 @@ def main():
     parser.add_argument('--max_val_batches', type=int, default=0)
     parser.add_argument('--max_test_batches', type=int, default=0)
     parser.add_argument('--change_threshold', type=float, default=0.2)
+    parser.add_argument('--resume_epoch', type=int, default=None, help='Resume training from this epoch index (loads matching checkpoints).')
+    parser.add_argument('--resume_model_path', type=str, default=None, help='Existing stamped experiment folder to reuse (log/result/checkpoint).')
     args = parser.parse_args()
 
     # Parse JSON config
     opt = parse_cfg(args)
     opt = dict_to_nonedict(opt)
 
-    # Build a stamped run folder name
-    exp_timestamp = datetime.now().strftime('%m%d_%H')
-    parts = [x for x in [args.dataset, args.tag, f"seed{args.seed}" if args.seed is not None else ""] if x]
-    suffix = "_".join(parts)
-    exp_folder = f"{suffix}_{exp_timestamp}" if suffix else exp_timestamp
+    # Build or reuse a stamped run folder name
+    if args.exp_folder:
+        exp_folder = args.exp_folder
+    else:
+        exp_timestamp = datetime.now().strftime('%m%d_%H')
+        parts = [x for x in [args.dataset, args.tag, f"seed{args.seed}" if args.seed is not None else ""] if x]
+        suffix = "_".join(parts)
+        exp_folder = f"{suffix}_{exp_timestamp}" if suffix else exp_timestamp
     make_stamped_dirs(opt, exp_folder)
 
     set_all_seeds(args.seed)
@@ -316,7 +321,32 @@ def main():
         n_epochs = opt['train']['n_epoch']
         accumulation_steps = int(opt['train'].get('grad_accum', 2))
 
-        for epoch in range(n_epochs):
+        # Resume support
+        start_epoch = 0
+        if args.resume_epoch is not None:
+            ckpt_dir = opt['path_cd']['checkpoint']
+            gen_path = os.path.join(ckpt_dir, f'cd_model_E{args.resume_epoch}_gen.pth')
+            opt_path = os.path.join(ckpt_dir, f'cd_model_E{args.resume_epoch}_opt.pth')
+            if os.path.exists(gen_path):
+                state = torch.load(gen_path, map_location=device)
+                cd_model.load_state_dict(state, strict=True)
+                logging.getLogger('base').info(f"[resume] Loaded model weights from {gen_path}")
+            else:
+                logging.getLogger('base').warning(f"[resume] Model checkpoint not found: {gen_path}")
+            if os.path.exists(opt_path):
+                opt_state = torch.load(opt_path, map_location=device)
+                if isinstance(opt_state, dict) and 'optimizer' in opt_state:
+                    optimizer.load_state_dict(opt_state['optimizer'])
+                    logging.getLogger('base').info(f"[resume] Loaded optimizer state from {opt_path}")
+            else:
+                logging.getLogger('base').warning(f"[resume] Optimizer checkpoint not found: {opt_path}")
+            start_epoch = int(args.resume_epoch)
+            try:
+                scheduler.last_epoch = start_epoch - 1
+            except Exception:
+                pass
+
+        for epoch in range(start_epoch, n_epochs):
             cd_model.train()
             metric_seg.clear()
             epoch_loss = 0.0
