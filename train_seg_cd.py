@@ -157,6 +157,7 @@ def main():
     parser.add_argument('--change_threshold', type=float, default=0.2)
     parser.add_argument('--resume_epoch', type=int, default=None, help='Resume training from this epoch index (loads matching checkpoints).')
     parser.add_argument('--resume_model_path', type=str, default=None, help='Existing stamped experiment folder to reuse (log/result/checkpoint).')
+    parser.add_argument('--exp_folder', type=str, default=None, help='Experiment folder name (if not provided, auto-generated from dataset/tag/seed).')
     args = parser.parse_args()
 
     # Parse JSON config
