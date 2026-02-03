@@ -72,6 +72,22 @@ def safe_to_numpy_uint8(x: torch.Tensor) -> np.ndarray:
     return np.squeeze(arr)
 
 
+def unpack_outputs(outputs):
+    seg1 = seg2 = change = None
+    if isinstance(outputs, (list, tuple)):
+        if len(outputs) == 2:
+            seg1, seg2 = outputs
+        elif len(outputs) >= 3:
+            seg1, seg2, change = outputs[0], outputs[1], outputs[2]
+    elif isinstance(outputs, dict):
+        seg1 = outputs.get('seg_t1')
+        seg2 = outputs.get('seg_t2')
+        change = outputs.get('change')
+    else:
+        change = outputs
+    return seg1, seg2, change
+
+
 # ----------------------------- main ----------------------------- #
 def main():
     parser = argparse.ArgumentParser()
@@ -171,6 +187,8 @@ def main():
     # Initialize from-to transition matrix
     n_classes = opt['model']['n_classes']
     transition_matrix = np.zeros((n_classes, n_classes), dtype=np.int64)
+    seg_metric = ConfuseMatrixMeter(n_class=n_classes)
+    had_seg_pred = False
 
     _max_test = args.max_test_batches
     _test_total = min(len(test_loader), _max_test) if _max_test > 0 else len(test_loader)
@@ -201,19 +219,35 @@ def main():
             else:
                 change_pred = outputs
 
+            # Also unpack possible segmentation logits
+            seg_logits_t1, seg_logits_t2, _ = unpack_outputs(outputs)
+
             # Derive ground truth change
             change_gt = derive_change_bin(y1, y2)
 
             # Get binary prediction
-            if change_pred.size(1) == 2:
-                cmask = torch.argmax(change_pred, dim=1)
+            if change_pred is not None:
+                if change_pred.size(1) == 2:
+                    cmask = torch.argmax(change_pred, dim=1)
+                else:
+                    cmask = (torch.sigmoid(change_pred[:, 0]) > args.change_threshold).long()
+            elif (seg_logits_t1 is not None) and (seg_logits_t2 is not None):
+                cmask = (torch.argmax(seg_logits_t1, dim=1) != torch.argmax(seg_logits_t2, dim=1)).long()
             else:
-                cmask = (torch.sigmoid(change_pred[:, 0]) > args.change_threshold).long()
+                cmask = None
 
-            pr_np, gt_np = cmask.cpu().numpy(), change_gt.cpu().numpy()
-            
-            # Update confusion matrix for SeK computation
-            test_metric.update_cm(pr=pr_np.astype(np.uint8), gt=gt_np.astype(np.uint8))
+            if cmask is not None:
+                pr_np, gt_np = cmask.cpu().numpy(), change_gt.cpu().numpy()
+                # Update confusion matrix for SeK computation
+                test_metric.update_cm(pr=pr_np.astype(np.uint8), gt=gt_np.astype(np.uint8))
+            # Update semantic segmentation confusion matrix if available
+            if (seg_logits_t1 is not None) and (seg_logits_t2 is not None):
+                p1 = torch.argmax(seg_logits_t1, dim=1)
+                p2 = torch.argmax(seg_logits_t2, dim=1)
+                seg_metric.update_cm(pr=safe_to_numpy_uint8(p1), gt=safe_to_numpy_uint8(y1))
+                seg_metric.update_cm(pr=safe_to_numpy_uint8(p2), gt=safe_to_numpy_uint8(y2))
+                had_seg_pred = True
+
             
             # Update from-to transition matrix (semantic class transitions)
             y1_np = y1.cpu().numpy().flatten()
@@ -223,12 +257,13 @@ def main():
                     transition_matrix[from_class, to_class] += 1
             
             # Manual TP/FP/FN/TN tracking
-            tp = np.logical_and(pr_np == 1, gt_np == 1).sum()
-            fp = np.logical_and(pr_np == 1, gt_np == 0).sum()
-            fn = np.logical_and(pr_np == 0, gt_np == 1).sum()
-            tn = np.logical_and(pr_np == 0, gt_np == 0).sum()
+            if cmask is not None:
+                tp = np.logical_and(pr_np == 1, gt_np == 1).sum()
+                fp = np.logical_and(pr_np == 1, gt_np == 0).sum()
+                fn = np.logical_and(pr_np == 0, gt_np == 1).sum()
+                tn = np.logical_and(pr_np == 0, gt_np == 0).sum()
 
-            test_tp += tp; test_fp += fp; test_fn += fn; test_tn += tn
+                test_tp += tp; test_fp += fp; test_fn += fn; test_tn += tn
 
             # Save visualizations for first few batches
             if tstep < 10:
@@ -237,15 +272,15 @@ def main():
                 img_B = Metrics.tensor2img(tb['B'], out_type=np.uint8, min_max=(-1, 1))
                 
                 # Save predictions and ground truth
-                pred_tensor = cmask.unsqueeze(1) if cmask.dim() == 3 else cmask.unsqueeze(0).unsqueeze(0)
+                if cmask is not None:
+                    pred_tensor = cmask.unsqueeze(1) if cmask.dim() == 3 else cmask.unsqueeze(0).unsqueeze(0)
+                    pred_cm = Metrics.tensor2img(pred_tensor.repeat(1, 3, 1, 1), out_type=np.uint8, min_max=(0, 1))
+                    Metrics.save_img(pred_cm, f'{test_result_path}/img_pred_cm_{tstep}.png')
                 gt_tensor = change_gt.unsqueeze(1) if change_gt.dim() == 3 else change_gt.unsqueeze(0).unsqueeze(0)
-                
-                pred_cm = Metrics.tensor2img(pred_tensor.repeat(1, 3, 1, 1), out_type=np.uint8, min_max=(0, 1))
                 gt_cm = Metrics.tensor2img(gt_tensor.repeat(1, 3, 1, 1), out_type=np.uint8, min_max=(0, 1))
 
                 Metrics.save_img(img_A, f'{test_result_path}/img_A_{tstep}.png')
                 Metrics.save_img(img_B, f'{test_result_path}/img_B_{tstep}.png')
-                Metrics.save_img(pred_cm, f'{test_result_path}/img_pred_cm_{tstep}.png')
                 Metrics.save_img(gt_cm, f'{test_result_path}/img_gt_cm_{tstep}.png')
 
     # Final metrics from confusion matrix
@@ -255,7 +290,20 @@ def main():
     test_f1 = 2 * test_prec * test_rec / (test_prec + test_rec + 1e-8)
     test_iou = test_tp / (test_tp + test_fp + test_fn + 1e-8)
     test_acc = (test_tp + test_tn) / (test_tp + test_tn + test_fp + test_fn + 1e-8)
-    test_sek = test_scores.get('SCD_Sek', 0.0)  # SeK metric from confusion matrix
+    test_sek = test_scores.get('SCD_Sek', 0.0)
+
+    # Semantic segmentation metrics (macro-averaged precision/recall)
+    seg_prec_macro = seg_rec_macro = seg_f1 = seg_iou = seg_acc = seg_sek = None
+    if had_seg_pred:
+        seg_scores = seg_metric.get_scores()
+        prec_vals = [seg_scores.get(f'precision_{i}', np.nan) for i in range(n_classes)]
+        rec_vals = [seg_scores.get(f'recall_{i}', np.nan) for i in range(n_classes)]
+        seg_prec_macro = float(np.nanmean(np.array(prec_vals)))
+        seg_rec_macro = float(np.nanmean(np.array(rec_vals)))
+        seg_f1 = float(seg_scores.get('mf1', 0.0))
+        seg_iou = float(seg_scores.get('miou', 0.0))
+        seg_acc = float(seg_scores.get('acc', 0.0))
+        seg_sek = float(seg_scores.get('SCD_Sek', 0.0))
     
     # Normalize transition matrix to percentages
     total_pixels = transition_matrix.sum()
@@ -306,14 +354,20 @@ def main():
     logger.info(f"Transition matrix saved to {os.path.join(test_result_path, 'transition_matrix.json')}")
 
     if use_wandb:
-        # Log scalar metrics
+        # Log scalar metrics with requested suffixes
         wandb.log({
-            'test/precision': test_prec,
-            'test/recall': test_rec,
-            'test/f1': test_f1,
-            'test/iou': test_iou,
-            'test/accuracy': test_acc,
-            'test/sek': test_sek
+            'test/precision_binary_change': float(test_prec),
+            'test/recall_binary_change': float(test_rec),
+            'test/f1_binary_change': float(test_f1),
+            'test/iou_binary_change': float(test_iou),
+            'test/accuracy_binary_change': float(test_acc),
+            'test/sek_binary_change': float(test_sek),
+            'test/precision_semantic_masks': seg_prec_macro if had_seg_pred else None,
+            'test/recall_semantic_masks': seg_rec_macro if had_seg_pred else None,
+            'test/f1_semantic_masks': seg_f1 if had_seg_pred else None,
+            'test/iou_semantic_masks': seg_iou if had_seg_pred else None,
+            'test/accuracy_semantic_masks': seg_acc if had_seg_pred else None,
+            'test/sek_semantic_masks': seg_sek if had_seg_pred else None,
         })
         
         # Log transition matrix as heatmap
