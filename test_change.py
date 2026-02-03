@@ -324,7 +324,7 @@ def main():
     logger.info("=" * 60)
     
     # Define class names (adjust based on your dataset)
-    class_names = ['no_veg', 'veg_turf', 'tree', 'water', 'building', 'playground']
+    class_names = ['low veg', 'nvg_surf', 'tree', 'water', 'building', 'playground']
     if n_classes != len(class_names):
         class_names = [f'class_{i}' for i in range(n_classes)]
     
