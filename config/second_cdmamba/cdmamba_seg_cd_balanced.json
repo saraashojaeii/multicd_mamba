@@ -3,15 +3,16 @@
   "gpu_ids": [0],
   
   "path_cd": {
-    "log": "experiments/logs",
-    "result": "experiments/results",
-    "checkpoint": "experiments/checkpoints"
+    "log": "/root/home/pvc/01_change_detection/Building_changedetection_job/experiments/logs",
+    "result": "/root/home/pvc/01_change_detection/Building_changedetection_job/experiments/results",
+    "checkpoint": "/root/home/pvc/01_change_detection/Building_changedetection_job/experiments/checkpoint",
+    "resume_state": null
   },
   
   "datasets": {
     "train": {
       "name": "SECOND",
-      "datasetroot": "/path/to/SECOND/dataset",
+      "datasetroot": "/root/home/pvc/01_change_detection/00_multiclass_datasets/SECOND/train",
       "resolution": 256,
       "phase": "train",
       "batch_size": 8,
@@ -21,7 +22,7 @@
     },
     "val": {
       "name": "SECOND",
-      "datasetroot": "/path/to/SECOND/dataset",
+      "datasetroot": "/root/home/pvc/01_change_detection/00_multiclass_datasets/SECOND/val",
       "resolution": 256,
       "phase": "val",
       "batch_size": 8,
@@ -30,7 +31,7 @@
     },
     "test": {
       "name": "SECOND",
-      "datasetroot": "/path/to/SECOND/dataset",
+      "datasetroot": "/root/home/pvc/01_change_detection/00_multiclass_datasets/SECOND/test",
       "resolution": 256,
       "phase": "test",
       "batch_size": 1,
