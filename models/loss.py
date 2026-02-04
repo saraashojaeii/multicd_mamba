@@ -557,16 +557,16 @@ class TripletChangeSegLoss(nn.Module):
         # Build change-aware weights: w = 1 + boost * change_mask
         w = 1.0 + self.boost * c.float().squeeze(1)  # [B,H,W]
         
-        # Apply transition-aware weights for changed pixels
+        # Apply transition-aware weights for changed pixels (optimized)
         if self.transition_weights is not None:
-            # Build per-pixel transition weight map
-            B, H, W = y1.shape
-            trans_w = torch.ones((B, H, W), device=y1.device, dtype=torch.float32)
-            changed_mask = (c.squeeze(1) > 0.5).bool()  # [B,H,W]
-            if changed_mask.any():
-                y1_chg = y1[changed_mask].long().clamp(0, self.transition_weights.size(0)-1)
-                y2_chg = y2[changed_mask].long().clamp(0, self.transition_weights.size(1)-1)
-                trans_w[changed_mask] = self.transition_weights[y1_chg, y2_chg]
+            # Use gather for faster indexing (no boolean mask)
+            y1_clamped = y1.long().clamp(0, self.transition_weights.size(0)-1)
+            y2_clamped = y2.long().clamp(0, self.transition_weights.size(1)-1)
+            # Index transition weights: trans_w[i,j,k] = W[y1[i,j,k], y2[i,j,k]]
+            trans_w = self.transition_weights[y1_clamped, y2_clamped]  # [B,H,W]
+            # Only apply to changed pixels (where c > 0.5)
+            changed_mask = (c.squeeze(1) > 0.5).float()  # [B,H,W]
+            trans_w = 1.0 + (trans_w - 1.0) * changed_mask  # Blend: unchanged=1.0, changed=trans_w
             w = w * trans_w
         
         valid1 = (y1 != self.ignore_index).float()

@@ -73,7 +73,7 @@
   },
   
   "train": {
-    "n_epoch": 100,
+    "n_epoch": 200,
     "val_freq": 1,
     "print_freq": 50,
     "save_checkpoint_freq": 5,
