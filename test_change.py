@@ -335,6 +335,60 @@ def main():
     test_iou = test_tp / (test_tp + test_fp + test_fn + 1e-8)
     test_acc = (test_tp + test_tn) / (test_tp + test_tn + test_fp + test_fn + 1e-8)
     test_sek = test_scores.get('SCD_Sek', 0.0)
+    
+    # Compute Eval_SCD.py metrics (for semantic change detection)
+    scd_mean_iou = scd_sek = scd_score = sc_precision = sc_recall = f_scd = None
+    if had_seg_pred:
+        # Get the full semantic confusion matrix (combined T1 and T2)
+        seg_cm = seg_metric.confusion_matrix
+        
+        # Build binary change confusion matrix from semantic confusion
+        # Following Eval_SCD.py logic:
+        # hist_fg = hist[1:, 1:] (foreground classes only, excluding class 0)
+        # c2hist[0][0] = TN (unchanged background)
+        # c2hist[0][1] = FP (predicted change, but no change)
+        # c2hist[1][0] = FN (missed change)
+        # c2hist[1][1] = TP (correct change detection)
+        
+        hist_fg = seg_cm[1:, 1:]  # Foreground classes only
+        c2hist = np.zeros((2, 2))
+        c2hist[0][0] = seg_cm[0][0]  # TN: unchanged background
+        c2hist[0][1] = seg_cm.sum(1)[0] - seg_cm[0][0]  # FP: pred changed, but gt unchanged
+        c2hist[1][0] = seg_cm.sum(0)[0] - seg_cm[0][0]  # FN: pred unchanged, but gt changed
+        c2hist[1][1] = hist_fg.sum()  # TP: both changed
+        
+        # Compute kappa_n0 (kappa without unchanged pixels)
+        hist_n0 = seg_cm.copy()
+        hist_n0[0][0] = 0
+        if hist_n0.sum() == 0:
+            kappa_n0 = 0
+        else:
+            po = np.diag(hist_n0).sum() / hist_n0.sum()
+            pe = np.matmul(hist_n0.sum(1), hist_n0.sum(0).T) / hist_n0.sum() ** 2
+            kappa_n0 = (po - pe) / (1 - pe + 1e-10)
+        
+        # Compute IoU for binary change
+        iu = np.diag(c2hist) / (c2hist.sum(1) + c2hist.sum(0) - np.diag(c2hist) + 1e-10)
+        IoU_fg = iu[1]  # IoU for changed pixels
+        scd_mean_iou = (iu[0] + iu[1]) / 2  # Mean IoU (unchanged + changed)
+        
+        # Compute SeK (Semantic change Kappa)
+        import math
+        scd_sek = (kappa_n0 * math.exp(IoU_fg)) / math.e
+        
+        # Compute Score (0.3*IoU_mean + 0.7*Sek)
+        scd_score = 0.3 * scd_mean_iou + 0.7 * scd_sek
+        
+        # Compute Semantic Change Precision/Recall/F1
+        pixel_sum = seg_cm.sum()
+        change_pred_sum = pixel_sum - seg_cm.sum(1)[0]  # Predicted changed pixels
+        change_label_sum = pixel_sum - seg_cm.sum(0)[0]  # GT changed pixels
+        SC_TP = np.diag(seg_cm[1:, 1:]).sum()  # Correctly predicted semantic changes
+        
+        sc_precision = SC_TP / (change_pred_sum + 1e-10)
+        sc_recall = SC_TP / (change_label_sum + 1e-10)
+        from scipy import stats as scipy_stats
+        f_scd = scipy_stats.hmean([sc_precision, sc_recall]) if (sc_precision > 0 and sc_recall > 0) else 0.0
 
     # Semantic segmentation metrics (macro-averaged precision/recall)
     seg_prec_macro = seg_rec_macro = seg_f1 = seg_iou = seg_acc = seg_sek = None
@@ -403,6 +457,19 @@ def main():
     logger.info(f"  Accuracy:  {test_acc:.4f}")
     logger.info(f"  SeK:       {test_sek:.4f}")
     logger.info("=" * 60)
+    
+    # Log Eval_SCD.py metrics
+    if scd_mean_iou is not None:
+        logger.info("\nEval_SCD Metrics (Semantic Change Detection):")
+        logger.info("=" * 60)
+        logger.info(f"  Mean IoU:      {scd_mean_iou*100:.3f}%")
+        logger.info(f"  SeK:           {scd_sek*100:.3f}%")
+        logger.info(f"  Score:         {scd_score*100:.3f}% (0.3*IoU + 0.7*SeK)")
+        logger.info(f"  SC_Precision:  {sc_precision*100:.3f}%")
+        logger.info(f"  SC_Recall:     {sc_recall*100:.3f}%")
+        logger.info(f"  F_scd:         {f_scd*100:.3f}%")
+        logger.info("=" * 60)
+    
     logger.info(f"Change pixel ratio (gt change): { (change_pix_sum / (total_pix_sum + 1e-8)) :.6f}")
     
     # Log transition matrix
@@ -492,6 +559,15 @@ def main():
                 test_metrics[f'test/transition_{trans_key}_count'] = trans_val['count']
                 test_metrics[f'test/transition_{trans_key}_correct_t1'] = trans_val['correct_t1']
                 test_metrics[f'test/transition_{trans_key}_correct_t2'] = trans_val['correct_t2']
+        
+        # Add Eval_SCD metrics
+        if scd_mean_iou is not None:
+            test_metrics['test/scd_mean_iou'] = float(scd_mean_iou)
+            test_metrics['test/scd_sek'] = float(scd_sek)
+            test_metrics['test/scd_score'] = float(scd_score)
+            test_metrics['test/sc_precision'] = float(sc_precision)
+            test_metrics['test/sc_recall'] = float(sc_recall)
+            test_metrics['test/f_scd'] = float(f_scd)
         
         wandb.log(test_metrics)
         
