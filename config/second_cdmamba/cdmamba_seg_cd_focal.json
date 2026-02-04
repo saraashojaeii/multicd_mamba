@@ -11,7 +11,8 @@
   "datasets": {
     "train": {
       "name": "SECOND",
-      "dataroot": "/path/to/SECOND/dataset",
+      "datasetroot": "/path/to/SECOND/dataset",
+      "resolution": 256,
       "phase": "train",
       "batch_size": 8,
       "num_workers": 4,
@@ -20,17 +21,21 @@
     },
     "val": {
       "name": "SECOND",
-      "dataroot": "/path/to/SECOND/dataset",
+      "datasetroot": "/path/to/SECOND/dataset",
+      "resolution": 256,
       "phase": "val",
       "batch_size": 8,
-      "num_workers": 4
+      "num_workers": 4,
+      "data_len": -1
     },
     "test": {
       "name": "SECOND",
-      "dataroot": "/path/to/SECOND/dataset",
+      "datasetroot": "/path/to/SECOND/dataset",
+      "resolution": 256,
       "phase": "test",
       "batch_size": 1,
-      "num_workers": 1
+      "num_workers": 1,
+      "data_len": -1
     }
   },
   
