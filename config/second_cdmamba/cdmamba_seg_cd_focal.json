@@ -1,0 +1,96 @@
+{
+  "name": "cdmamba_seg_cd_focal",
+  "gpu_ids": [0],
+  
+  "path_cd": {
+    "log": "experiments/logs",
+    "result": "experiments/results",
+    "checkpoint": "experiments/checkpoints"
+  },
+  
+  "datasets": {
+    "train": {
+      "name": "SECOND",
+      "dataroot": "/path/to/SECOND/dataset",
+      "phase": "train",
+      "batch_size": 8,
+      "num_workers": 4,
+      "use_shuffle": true,
+      "data_len": -1
+    },
+    "val": {
+      "name": "SECOND",
+      "dataroot": "/path/to/SECOND/dataset",
+      "phase": "val",
+      "batch_size": 8,
+      "num_workers": 4
+    },
+    "test": {
+      "name": "SECOND",
+      "dataroot": "/path/to/SECOND/dataset",
+      "phase": "test",
+      "batch_size": 1,
+      "num_workers": 1
+    }
+  },
+  
+  "model": {
+    "name": "cdmamba_seg_cd",
+    "loss": "extended_triplet",
+    "extended_triplet": {
+      "seg_loss": "focal_ce_dice",
+      "focal_gamma": 2.0,
+      "lambda_seg": 1.5,
+      "lambda_cd": 1.0,
+      "lambda_unch": 0.1,
+      "lambda_ch": 0.2,
+      "lambda_cpl": 0.1,
+      "boost": 5.0,
+      "T": 4.0,
+      "margin": 0.3
+    },
+    "use_change_head": true,
+    "init_filters": 16,
+    "n_classes": 6,
+    "conv_mode": "deepwise",
+    "up_conv_mode": "deepwise",
+    "spatial_dims": 2,
+    "in_channels": 3,
+    "in_nc": 3,
+    "blocks_down": [1, 2, 2, 4],
+    "blocks_up": [1, 1, 1],
+    "norm": ["GROUP", {"num_groups": 8}]
+  },
+  
+  "train": {
+    "n_epoch": 100,
+    "val_freq": 1,
+    "print_freq": 50,
+    "save_checkpoint_freq": 5,
+    "ignore_index": 255,
+    "grad_accum": 2,
+    
+    "optimizer": {
+      "type": "adamW",
+      "lr": 0.0001,
+      "weight_decay": 0.0001,
+      "beta1": 0.9,
+      "beta2": 0.999,
+      "eta_min": 1e-6
+    },
+    
+    "use_balanced_sampler": true,
+    "balanced_sampler": {
+      "change_threshold": 0.01,
+      "rare_classes": [3, 5],
+      "oversample_factor": 2.0,
+      "precompute_stats": true,
+      "max_precompute": 1000
+    }
+  },
+  
+  "wandb": {
+    "project": "change-detection-focal",
+    "entity": null
+  }
+}

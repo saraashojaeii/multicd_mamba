@@ -22,6 +22,85 @@ def estimate_class_counts(dataloader, num_classes: int, ignore_index: int = 255,
             break
     return counts
 
+def estimate_transition_matrix(dataloader, num_classes: int, ignore_index: int = 255, max_batches=None):
+    """Compute transition matrix [C, C] from GT labels (changed pixels only).
+    
+    Returns:
+        transition_matrix: [C, C] tensor with counts of transitions from class i to class j
+    """
+    transition_matrix = torch.zeros((num_classes, num_classes), dtype=torch.long)
+    seen = 0
+    for batch in dataloader:
+        if isinstance(batch, dict):
+            y1 = batch.get("L1")
+            y2 = batch.get("L2")
+        else:
+            # Assume (X1, X2, Y1, Y2) or similar
+            y1, y2 = batch[2], batch[3]
+        
+        if y1 is None or y2 is None:
+            continue
+            
+        y1 = y1.long()
+        y2 = y2.long()
+        
+        # Only count changed pixels
+        changed_mask = (y1 != y2)
+        valid_mask = (y1 != ignore_index) & (y2 != ignore_index) & \
+                     (y1 >= 0) & (y1 < num_classes) & \
+                     (y2 >= 0) & (y2 < num_classes)
+        mask = changed_mask & valid_mask
+        
+        if mask.any():
+            y1_chg = y1[mask].cpu().numpy()
+            y2_chg = y2[mask].cpu().numpy()
+            for from_cls, to_cls in zip(y1_chg, y2_chg):
+                transition_matrix[from_cls, to_cls] += 1
+        
+        seen += 1
+        if max_batches is not None and seen >= max_batches:
+            break
+    
+    return transition_matrix
+
+def compute_transition_weights(transition_matrix: torch.Tensor, method: str = "inverse_frequency", 
+                               eps: float = 1e-8, smooth: float = 1.0) -> torch.Tensor:
+    """Compute per-transition weights from transition matrix to rebalance rare transitions.
+    
+    Args:
+        transition_matrix: [C, C] tensor with transition counts
+        method: "inverse_frequency" or "sqrt_inverse"
+        eps: small constant to avoid division by zero
+        smooth: smoothing factor (add to all counts before computing weights)
+    
+    Returns:
+        weights: [C, C] tensor with weights for each transition
+    """
+    tm = transition_matrix.float() + smooth
+    total = tm.sum()
+    
+    if total < eps:
+        # No transitions observed, return uniform weights
+        return torch.ones_like(tm)
+    
+    freq = tm / total  # [C, C] frequencies
+    
+    if method == "inverse_frequency":
+        # w[i,j] = median(freq) / freq[i,j]
+        median_freq = torch.median(freq[freq > 0]) if (freq > 0).any() else torch.tensor(1.0)
+        weights = median_freq / (freq + eps)
+    elif method == "sqrt_inverse":
+        # Softer rebalancing: w[i,j] = sqrt(median / freq[i,j])
+        median_freq = torch.median(freq[freq > 0]) if (freq > 0).any() else torch.tensor(1.0)
+        weights = torch.sqrt(median_freq / (freq + eps))
+    else:
+        raise ValueError(f"Unknown method: {method}")
+    
+    # Clamp to avoid extreme weights
+    weights = weights.clamp(min=0.1, max=10.0)
+    
+    return weights
+
 def set_seed(seed: int):
     """Ensure reproducibility across runs."""
     if seed is None:

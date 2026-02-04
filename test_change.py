@@ -38,6 +38,7 @@ from core.logger import setup_logger, dict2str, dict_to_nonedict
 from misc.metric_tools import ConfuseMatrixMeter
 from misc.torchutils import get_scheduler, save_network
 from models.loss import *
+from core.metrics import compute_semantic_metrics_on_changed, compute_per_class_metrics, compute_transition_metrics
 
 # ----------------------------- helpers ----------------------------- #
 def set_all_seeds(seed: int | None):
@@ -189,6 +190,18 @@ def main():
     transition_matrix = np.zeros((n_classes, n_classes), dtype=np.int64)
     seg_metric = ConfuseMatrixMeter(n_class=n_classes)
     had_seg_pred = False
+    change_pix_sum = 0
+    total_pix_sum = 0
+    
+    # Accumulators for changed-pixel metrics and transitions
+    all_pred_t1_changed = []
+    all_pred_t2_changed = []
+    all_gt_t1_changed = []
+    all_gt_t2_changed = []
+    all_pred_t1_all = []
+    all_pred_t2_all = []
+    all_gt_t1_all = []
+    all_gt_t2_all = []
 
     _max_test = args.max_test_batches
     _test_total = min(len(test_loader), _max_test) if _max_test > 0 else len(test_loader)
@@ -247,14 +260,45 @@ def main():
                 seg_metric.update_cm(pr=safe_to_numpy_uint8(p1), gt=safe_to_numpy_uint8(y1))
                 seg_metric.update_cm(pr=safe_to_numpy_uint8(p2), gt=safe_to_numpy_uint8(y2))
                 had_seg_pred = True
+                
+                # Accumulate for changed-pixel metrics
+                p1_np = p1.cpu().numpy()
+                p2_np = p2.cpu().numpy()
+                y1_np = y1.cpu().numpy()
+                y2_np = y2.cpu().numpy()
+                
+                # Store changed pixels
+                changed_mask = (y1_np != y2_np)
+                valid_mask = (y1_np != ignore_index) & (y2_np != ignore_index)
+                mask_chg = changed_mask & valid_mask
+                
+                if mask_chg.any():
+                    all_pred_t1_changed.append(p1_np[mask_chg])
+                    all_pred_t2_changed.append(p2_np[mask_chg])
+                    all_gt_t1_changed.append(y1_np[mask_chg])
+                    all_gt_t2_changed.append(y2_np[mask_chg])
+                
+                # Store all pixels
+                valid_t1 = (y1_np != ignore_index)
+                valid_t2 = (y2_np != ignore_index)
+                if valid_t1.any():
+                    all_pred_t1_all.append(p1_np[valid_t1])
+                    all_gt_t1_all.append(y1_np[valid_t1])
+                if valid_t2.any():
+                    all_pred_t2_all.append(p2_np[valid_t2])
+                    all_gt_t2_all.append(y2_np[valid_t2])
 
             
             # Update from-to transition matrix (semantic class transitions)
-            y1_np = y1.cpu().numpy().flatten()
-            y2_np = y2.cpu().numpy().flatten()
-            for from_class, to_class in zip(y1_np, y2_np):
-                if 0 <= from_class < n_classes and 0 <= to_class < n_classes:
-                    transition_matrix[from_class, to_class] += 1
+            mask_chg = (y1 != y2)
+            change_pix_sum += int(mask_chg.sum().item())
+            total_pix_sum += int(mask_chg.numel())
+            if mask_chg.any().item():
+                y1_np = y1[mask_chg].cpu().numpy().flatten()
+                y2_np = y2[mask_chg].cpu().numpy().flatten()
+                for from_class, to_class in zip(y1_np, y2_np):
+                    if 0 <= from_class < n_classes and 0 <= to_class < n_classes:
+                        transition_matrix[from_class, to_class] += 1
             
             # Manual TP/FP/FN/TN tracking
             if cmask is not None:
@@ -294,6 +338,8 @@ def main():
 
     # Semantic segmentation metrics (macro-averaged precision/recall)
     seg_prec_macro = seg_rec_macro = seg_f1 = seg_iou = seg_acc = seg_sek = None
+    changed_metrics = per_class_metrics = transition_metrics = None
+    
     if had_seg_pred:
         seg_scores = seg_metric.get_scores()
         prec_vals = [seg_scores.get(f'precision_{i}', np.nan) for i in range(n_classes)]
@@ -304,10 +350,49 @@ def main():
         seg_iou = float(seg_scores.get('miou', 0.0))
         seg_acc = float(seg_scores.get('acc', 0.0))
         seg_sek = float(seg_scores.get('SCD_Sek', 0.0))
+        
+        # Compute metrics on changed pixels only
+        if all_pred_t1_changed and all_pred_t2_changed:
+            pred_t1_chg = np.concatenate(all_pred_t1_changed)
+            pred_t2_chg = np.concatenate(all_pred_t2_changed)
+            gt_t1_chg = np.concatenate(all_gt_t1_changed)
+            gt_t2_chg = np.concatenate(all_gt_t2_changed)
+            
+            # Reshape to [1, N] to match expected input
+            pred_t1_chg = pred_t1_chg.reshape(1, -1)
+            pred_t2_chg = pred_t2_chg.reshape(1, -1)
+            gt_t1_chg = gt_t1_chg.reshape(1, -1)
+            gt_t2_chg = gt_t2_chg.reshape(1, -1)
+            
+            changed_metrics = compute_semantic_metrics_on_changed(
+                pred_t1_chg, pred_t2_chg, gt_t1_chg, gt_t2_chg, n_classes, ignore_index
+            )
+        
+        # Compute per-class metrics (all pixels)
+        if all_pred_t1_all and all_pred_t2_all:
+            pred_t1_all = np.concatenate(all_pred_t1_all).reshape(1, -1)
+            pred_t2_all = np.concatenate(all_pred_t2_all).reshape(1, -1)
+            gt_t1_all = np.concatenate(all_gt_t1_all).reshape(1, -1)
+            gt_t2_all = np.concatenate(all_gt_t2_all).reshape(1, -1)
+            
+            per_class_metrics = compute_per_class_metrics(
+                pred_t1_all, pred_t2_all, gt_t1_all, gt_t2_all, n_classes, ignore_index
+            )
+        
+        # Compute top transition metrics
+        if all_pred_t1_changed and all_pred_t2_changed:
+            # Top transitions: nvg_surf→building (1→4), low_veg↔nvg_surf (0↔1), low_veg→building (0→4)
+            top_transitions = [(1, 4), (0, 1), (1, 0), (0, 4)]
+            transition_metrics = compute_transition_metrics(
+                pred_t1_chg, pred_t2_chg, gt_t1_chg, gt_t2_chg, top_transitions, n_classes, ignore_index
+            )
     
     # Normalize transition matrix to percentages
     total_pixels = transition_matrix.sum()
-    transition_matrix_pct = (transition_matrix / total_pixels * 100) if total_pixels > 0 else transition_matrix
+    tm = transition_matrix.astype(np.float64)
+    transition_matrix_pct_global = (tm / total_pixels * 100.0) if total_pixels > 0 else tm
+    row_sums = tm.sum(axis=1, keepdims=True)
+    transition_matrix_pct_row = np.divide(tm * 100.0, row_sums, out=np.zeros_like(tm), where=row_sums != 0)
 
     logger.info("=" * 60)
     logger.info("Test Results:")
@@ -318,9 +403,10 @@ def main():
     logger.info(f"  Accuracy:  {test_acc:.4f}")
     logger.info(f"  SeK:       {test_sek:.4f}")
     logger.info("=" * 60)
+    logger.info(f"Change pixel ratio (gt change): { (change_pix_sum / (total_pix_sum + 1e-8)) :.6f}")
     
     # Log transition matrix
-    logger.info("\nFrom-To Transition Matrix (percentages):")
+    logger.info("\nFrom-To Transition Matrix (global %):")
     logger.info("=" * 60)
     
     # Define class names (adjust based on your dataset)
@@ -335,7 +421,15 @@ def main():
     
     # Print matrix rows
     for i, from_name in enumerate(class_names):
-        row_str = f"{from_name:>10}  " + "  ".join([f"{transition_matrix_pct[i, j]:>9.2f}%" for j in range(n_classes)])
+        row_str = f"{from_name:>10}  " + "  ".join([f"{transition_matrix_pct_global[i, j]:>9.2f}%" for j in range(n_classes)])
+        logger.info(row_str)
+    
+    logger.info("\nFrom-To Transition Matrix (row-normalized %):")
+    logger.info("=" * 60)
+    logger.info(header)
+    logger.info("-" * len(header))
+    for i, from_name in enumerate(class_names):
+        row_str = f"{from_name:>10}  " + "  ".join([f"{transition_matrix_pct_row[i, j]:>9.2f}%" for j in range(n_classes)])
         logger.info(row_str)
     
     logger.info("=" * 60)
@@ -345,9 +439,12 @@ def main():
     import json
     transition_data = {
         'matrix_counts': transition_matrix.tolist(),
-        'matrix_percentages': transition_matrix_pct.tolist(),
+        'matrix_percentages': transition_matrix_pct_global.tolist(),
+        'matrix_percentages_global': transition_matrix_pct_global.tolist(),
+        'matrix_percentages_row': transition_matrix_pct_row.tolist(),
         'class_names': class_names,
-        'total_pixels': int(total_pixels)
+        'total_pixels': int(total_pixels),
+        'change_pixel_ratio': float(change_pix_sum / (total_pix_sum + 1e-8))
     }
     with open(os.path.join(test_result_path, 'transition_matrix.json'), 'w') as f:
         json.dump(transition_data, f, indent=2)
@@ -355,7 +452,7 @@ def main():
 
     if use_wandb:
         # Log scalar metrics with requested suffixes
-        wandb.log({
+        test_metrics = {
             'test/precision_binary_change': float(test_prec),
             'test/recall_binary_change': float(test_rec),
             'test/f1_binary_change': float(test_f1),
@@ -368,24 +465,64 @@ def main():
             'test/iou_semantic_masks': seg_iou if had_seg_pred else None,
             'test/accuracy_semantic_masks': seg_acc if had_seg_pred else None,
             'test/sek_semantic_masks': seg_sek if had_seg_pred else None,
-        })
+            'test/change_pixel_ratio': float(change_pix_sum / (total_pix_sum + 1e-8)),
+        }
+        
+        # Add metrics on changed pixels only
+        if changed_metrics:
+            test_metrics['test/changed_pixels_iou'] = changed_metrics['iou']
+            test_metrics['test/changed_pixels_f1'] = changed_metrics['f1']
+            test_metrics['test/changed_pixels_acc'] = changed_metrics['accuracy']
+        
+        # Add per-class metrics (key classes: building=4, nvg_surf=1, water=3, playground=5)
+        if per_class_metrics:
+            test_metrics['test/class_building_iou'] = per_class_metrics['iou_per_class'][4] if len(per_class_metrics['iou_per_class']) > 4 else 0.0
+            test_metrics['test/class_building_f1'] = per_class_metrics['f1_per_class'][4] if len(per_class_metrics['f1_per_class']) > 4 else 0.0
+            test_metrics['test/class_nvg_surf_iou'] = per_class_metrics['iou_per_class'][1] if len(per_class_metrics['iou_per_class']) > 1 else 0.0
+            test_metrics['test/class_nvg_surf_f1'] = per_class_metrics['f1_per_class'][1] if len(per_class_metrics['f1_per_class']) > 1 else 0.0
+            test_metrics['test/class_water_iou'] = per_class_metrics['iou_per_class'][3] if len(per_class_metrics['iou_per_class']) > 3 else 0.0
+            test_metrics['test/class_water_f1'] = per_class_metrics['f1_per_class'][3] if len(per_class_metrics['f1_per_class']) > 3 else 0.0
+            test_metrics['test/class_playground_iou'] = per_class_metrics['iou_per_class'][5] if len(per_class_metrics['iou_per_class']) > 5 else 0.0
+            test_metrics['test/class_playground_f1'] = per_class_metrics['f1_per_class'][5] if len(per_class_metrics['f1_per_class']) > 5 else 0.0
+        
+        # Add transition metrics
+        if transition_metrics:
+            for trans_key, trans_val in transition_metrics.items():
+                test_metrics[f'test/transition_{trans_key}_acc'] = trans_val['accuracy']
+                test_metrics[f'test/transition_{trans_key}_count'] = trans_val['count']
+                test_metrics[f'test/transition_{trans_key}_correct_t1'] = trans_val['correct_t1']
+                test_metrics[f'test/transition_{trans_key}_correct_t2'] = trans_val['correct_t2']
+        
+        wandb.log(test_metrics)
         
         # Log transition matrix as heatmap
         import matplotlib.pyplot as plt
         import seaborn as sns
         
         fig, ax = plt.subplots(figsize=(10, 8))
-        sns.heatmap(transition_matrix_pct, annot=True, fmt='.2f', cmap='Greens', 
+        sns.heatmap(transition_matrix_pct_global, annot=True, fmt='.2f', cmap='Greens', 
                     xticklabels=class_names, yticklabels=class_names,
                     cbar_kws={'label': 'Percentage (%)'},
                     ax=ax)
         ax.set_xlabel('To (T2)')
         ax.set_ylabel('From (T1)')
-        ax.set_title('From-To Transition Matrix (%)')
+        ax.set_title('From-To Transition Matrix (Global %)')
         plt.tight_layout()
         
-        wandb.log({'test/transition_matrix': wandb.Image(fig)})
+        wandb.log({'test/transition_matrix_global': wandb.Image(fig)})
         plt.close(fig)
+
+        fig2, ax2 = plt.subplots(figsize=(10, 8))
+        sns.heatmap(transition_matrix_pct_row, annot=True, fmt='.2f', cmap='Greens', 
+                    xticklabels=class_names, yticklabels=class_names,
+                    cbar_kws={'label': 'Percentage (%)'},
+                    ax=ax2)
+        ax2.set_xlabel('To (T2)')
+        ax2.set_ylabel('From (T1)')
+        ax2.set_title('From-To Transition Matrix (Row-normalized %)')
+        plt.tight_layout()
+        wandb.log({'test/transition_matrix_row': wandb.Image(fig2)})
+        plt.close(fig2)
         
         wandb.finish()
 

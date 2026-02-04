@@ -510,7 +510,10 @@ class TripletChangeSegLoss(nn.Module):
                  lambda_ch: float = 0.2,
                  lambda_cpl: float = 0.5,
                  T: float = 4.0,
-                 margin: float = 0.3):
+                 margin: float = 0.3,
+                 boost: float = 5.0,
+                 ignore_index: int = 255,
+                 transition_weights: torch.Tensor = None):
         super().__init__()
         self.seg_loss_fn = seg_loss_fn
         self.cd_loss = ChangeHeadBCEDiceLoss(lambda_dice=1.0)
@@ -523,6 +526,11 @@ class TripletChangeSegLoss(nn.Module):
         self.lam_unch = lambda_unch
         self.lam_ch = lambda_ch
         self.lam_cpl = lambda_cpl
+        self.boost = float(boost)
+        self.ignore_index = int(ignore_index)
+        self.eps = 1e-8
+        # Transition weights [C, C] for rebalancing changed pixels
+        self.register_buffer('transition_weights', transition_weights if transition_weights is not None else None)
 
     def forward(self, preds, targets):
         z1, z2, u = preds
@@ -530,8 +538,44 @@ class TripletChangeSegLoss(nn.Module):
         y2 = targets["seg_t2"]
         c  = targets["change"]
 
-        L_t1 = self.seg_loss_fn(z1, y1)
-        L_t2 = self.seg_loss_fn(z2, y2)
+        # Ensure change mask shape [B,1,H,W]
+        if c.dim() == 3:
+            c = c.unsqueeze(1)
+        c = _resize_like(c, z1)
+
+        # Compute per-pixel seg loss maps; if seg_loss_fn returns a scalar, fall back to CE(no reduction)
+        loss_map_t1 = self.seg_loss_fn(z1, y1)
+        if not isinstance(loss_map_t1, torch.Tensor) or loss_map_t1.dim() < 2:
+            z1r = _resize_like(z1, y1)
+            loss_map_t1 = F.cross_entropy(z1r, y1.long(), ignore_index=self.ignore_index, reduction='none')  # [B,H,W]
+
+        loss_map_t2 = self.seg_loss_fn(z2, y2)
+        if not isinstance(loss_map_t2, torch.Tensor) or loss_map_t2.dim() < 2:
+            z2r = _resize_like(z2, y2)
+            loss_map_t2 = F.cross_entropy(z2r, y2.long(), ignore_index=self.ignore_index, reduction='none')  # [B,H,W]
+
+        # Build change-aware weights: w = 1 + boost * change_mask
+        w = 1.0 + self.boost * c.float().squeeze(1)  # [B,H,W]
+        
+        # Apply transition-aware weights for changed pixels
+        if self.transition_weights is not None:
+            # Build per-pixel transition weight map
+            B, H, W = y1.shape
+            trans_w = torch.ones((B, H, W), device=y1.device, dtype=torch.float32)
+            changed_mask = (c.squeeze(1) > 0.5).bool()  # [B,H,W]
+            if changed_mask.any():
+                y1_chg = y1[changed_mask].long().clamp(0, self.transition_weights.size(0)-1)
+                y2_chg = y2[changed_mask].long().clamp(0, self.transition_weights.size(1)-1)
+                trans_w[changed_mask] = self.transition_weights[y1_chg, y2_chg]
+            w = w * trans_w
+        
+        valid1 = (y1 != self.ignore_index).float()
+        valid2 = (y2 != self.ignore_index).float()
+        w1 = w * valid1
+        w2 = w * valid2
+
+        L_t1 = (loss_map_t1 * w1).sum() / (w1.sum() + self.eps)
+        L_t2 = (loss_map_t2 * w2).sum() / (w2.sum() + self.eps)
         L_seg = L_t1 + L_t2
         L_cd  = self.cd_loss(u, c)
         L_unch = self.unch_kl(z1, z2, c)
@@ -657,6 +701,184 @@ class WeightedCrossEntropy(nn.Module):
             reduction=self.reduction,
             label_smoothing=self.label_smoothing,
         )
+
+class PerPixelDiceLoss(nn.Module):
+    """Dice loss that returns per-pixel loss map [B,H,W] for change-aware weighting."""
+    def __init__(self, num_classes: int, ignore_index: int = 255, smooth: float = 1.0):
+        super().__init__()
+        self.num_classes = num_classes
+        self.ignore_index = ignore_index
+        self.smooth = smooth
+    
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        logits: [B,C,H,W]; target: [B,H,W]
+        Returns: [B,H,W] per-pixel dice loss
+        """
+        B, C, H, W = logits.shape
+        probs = F.softmax(logits, dim=1)  # [B,C,H,W]
+        
+        # Create one-hot target
+        target_clamped = target.clone()
+        valid = (target != self.ignore_index)
+        target_clamped[~valid] = 0
+        target_oh = F.one_hot(target_clamped, num_classes=C).permute(0, 3, 1, 2).float()  # [B,C,H,W]
+        
+        # Mask invalid pixels
+        valid_f = valid.unsqueeze(1).float()  # [B,1,H,W]
+        probs = probs * valid_f
+        target_oh = target_oh * valid_f
+        
+        # Per-pixel dice: for each pixel, compute dice over classes
+        # intersection and union per pixel
+        intersection = (probs * target_oh).sum(dim=1)  # [B,H,W]
+        union = probs.sum(dim=1) + target_oh.sum(dim=1)  # [B,H,W]
+        
+        dice_per_pixel = (2.0 * intersection + self.smooth) / (union + self.smooth)  # [B,H,W]
+        loss_per_pixel = 1.0 - dice_per_pixel
+        
+        return loss_per_pixel
+
+class WeightedCEDicePerPixel(nn.Module):
+    """Weighted CE + Dice loss that returns per-pixel loss map [B,H,W].
+    
+    This is the recommended loss for rare class handling with change-aware weighting.
+    """
+    def __init__(
+        self,
+        num_classes: int,
+        class_weights: Optional[torch.Tensor] = None,
+        ignore_index: int = 255,
+        lambda_ce: float = 0.5,
+        lambda_dice: float = 0.5,
+        label_smoothing: float = 0.0,
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+        self.lambda_ce = lambda_ce
+        self.lambda_dice = lambda_dice
+        
+        self.ce = WeightedCrossEntropy(
+            class_weights=class_weights,
+            ignore_index=ignore_index,
+            reduction='none',  # per-pixel
+            label_smoothing=label_smoothing,
+        )
+        self.dice = PerPixelDiceLoss(
+            num_classes=num_classes,
+            ignore_index=ignore_index,
+            smooth=1.0,
+        )
+    
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Returns: [B,H,W] per-pixel loss map
+        """
+        ce_loss = self.ce(logits, target)  # [B,H,W]
+        dice_loss = self.dice(logits, target)  # [B,H,W]
+        return self.lambda_ce * ce_loss + self.lambda_dice * dice_loss
+
+class FocalLoss(nn.Module):
+    """Focal Loss for handling class imbalance (per-pixel).
+    
+    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+    """
+    def __init__(
+        self,
+        num_classes: int,
+        alpha: Optional[torch.Tensor] = None,
+        gamma: float = 2.0,
+        ignore_index: int = 255,
+        reduction: str = 'none',
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+        self.gamma = gamma
+        self.ignore_index = ignore_index
+        self.reduction = reduction
+        self.register_buffer('alpha', alpha if alpha is not None else None)
+    
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        logits: [B,C,H,W]; target: [B,H,W]
+        Returns: [B,H,W] if reduction='none'
+        """
+        B, C, H, W = logits.shape
+        
+        # Get log probabilities
+        log_probs = F.log_softmax(logits, dim=1)  # [B,C,H,W]
+        probs = torch.exp(log_probs)
+        
+        # Gather target class probabilities
+        target_clamped = target.clone()
+        valid = (target != self.ignore_index)
+        target_clamped[~valid] = 0
+        
+        # Get probability of target class for each pixel
+        target_oh = F.one_hot(target_clamped, num_classes=C).permute(0, 3, 1, 2).float()  # [B,C,H,W]
+        p_t = (probs * target_oh).sum(dim=1)  # [B,H,W]
+        log_p_t = (log_probs * target_oh).sum(dim=1)  # [B,H,W]
+        
+        # Focal term
+        focal_weight = (1 - p_t) ** self.gamma
+        
+        # Alpha weighting
+        if self.alpha is not None:
+            alpha_t = (self.alpha.unsqueeze(0).unsqueeze(-1).unsqueeze(-1) * target_oh).sum(dim=1)  # [B,H,W]
+            focal_weight = alpha_t * focal_weight
+        
+        # Focal loss
+        loss = -focal_weight * log_p_t  # [B,H,W]
+        
+        # Mask invalid pixels
+        loss = loss * valid.float()
+        
+        if self.reduction == 'mean':
+            return loss.sum() / (valid.sum() + 1e-8)
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:  # 'none'
+            return loss
+
+class FocalCEDicePerPixel(nn.Module):
+    """Focal CE + Dice loss that returns per-pixel loss map [B,H,W].
+    
+    Alternative to WeightedCEDicePerPixel for extreme class imbalance.
+    """
+    def __init__(
+        self,
+        num_classes: int,
+        class_weights: Optional[torch.Tensor] = None,
+        gamma: float = 2.0,
+        ignore_index: int = 255,
+        lambda_focal: float = 0.5,
+        lambda_dice: float = 0.5,
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+        self.lambda_focal = lambda_focal
+        self.lambda_dice = lambda_dice
+        
+        self.focal = FocalLoss(
+            num_classes=num_classes,
+            alpha=class_weights,
+            gamma=gamma,
+            ignore_index=ignore_index,
+            reduction='none',
+        )
+        self.dice = PerPixelDiceLoss(
+            num_classes=num_classes,
+            ignore_index=ignore_index,
+            smooth=1.0,
+        )
+    
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Returns: [B,H,W] per-pixel loss map
+        """
+        focal_loss = self.focal(logits, target)  # [B,H,W]
+        dice_loss = self.dice(logits, target)  # [B,H,W]
+        return self.lambda_focal * focal_loss + self.lambda_dice * dice_loss
 
 class SoftDiceLoss(nn.Module):
     def __init__(

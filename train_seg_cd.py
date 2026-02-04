@@ -37,6 +37,7 @@ from misc.metric_tools import ConfuseMatrixMeter
 from misc.torchutils import get_scheduler, save_network  # keep compatibility
 from models.loss import *            # noqa: F401,F403
 from models.loss import MultiClassCDLoss  # explicit import
+from core.metrics import compute_semantic_metrics_on_changed, compute_per_class_metrics, compute_transition_metrics
 
 
 # ----------------------------- helpers ----------------------------- #
@@ -198,7 +199,32 @@ def main():
     for phase, dataset_opt in opt['datasets'].items():
         if phase == 'train' and args.phase != 'test':
             train_set = Data.create_scd_dataset(dataset_opt=dataset_opt, phase='train')
-            train_loader = Data.create_cd_dataloader(train_set, dataset_opt, 'train', seed_worker=None, g=None)
+            
+            # Optional: Use balanced sampler for training
+            use_balanced_sampler = opt.get('train', {}).get('use_balanced_sampler', False)
+            if use_balanced_sampler:
+                from data.balanced_sampler import BalancedChangeSampler
+                sampler_cfg = opt.get('train', {}).get('balanced_sampler', {})
+                train_sampler = BalancedChangeSampler(
+                    train_set,
+                    change_threshold=sampler_cfg.get('change_threshold', 0.01),
+                    rare_classes=sampler_cfg.get('rare_classes', [3, 5]),  # water, playground
+                    oversample_factor=sampler_cfg.get('oversample_factor', 2.0),
+                    precompute_stats=sampler_cfg.get('precompute_stats', True),
+                    max_precompute=sampler_cfg.get('max_precompute', 1000),
+                )
+                logger.info(f"Using BalancedChangeSampler with change_threshold={sampler_cfg.get('change_threshold', 0.01)}")
+                # Create dataloader with custom sampler (note: shuffle must be False when using sampler)
+                train_loader = torch.utils.data.DataLoader(
+                    train_set,
+                    batch_size=dataset_opt['batch_size'],
+                    sampler=train_sampler,
+                    num_workers=dataset_opt.get('num_workers', 4),
+                    pin_memory=True,
+                )
+            else:
+                train_loader = Data.create_cd_dataloader(train_set, dataset_opt, 'train', seed_worker=None, g=None)
+            
             opt['len_train_dataloader'] = len(train_loader)
         elif phase == 'val' and args.phase != 'test':
             val_set = Data.create_scd_dataset(dataset_opt=dataset_opt, phase='val')
@@ -216,8 +242,17 @@ def main():
         counts = estimate_class_counts(train_loader, num_classes=num_classes, ignore_index=ignore_index, max_batches=200)
         ce_weights = compute_class_weights(counts, method="median_frequency").to(device)
         dice_weights = ce_weights.clone()
+        
+        # Compute transition weights for rebalancing rare transitions
+        logger.info("Computing transition matrix from training data...")
+        from core.utils import estimate_transition_matrix, compute_transition_weights
+        transition_matrix = estimate_transition_matrix(train_loader, num_classes=num_classes, 
+                                                       ignore_index=ignore_index, max_batches=200)
+        transition_weights = compute_transition_weights(transition_matrix, method="inverse_frequency").to(device)
+        logger.info(f"Transition matrix computed. Total transitions: {transition_matrix.sum()}")
+        logger.info(f"Transition weights range: [{transition_weights.min():.3f}, {transition_weights.max():.3f}]")
     else:
-        ce_weights = dice_weights = None
+        ce_weights = dice_weights = transition_weights = None
 
     # Model
     cd_model = Model.create_CD_model(opt)
@@ -270,8 +305,33 @@ def main():
         loss_fun = DiceOnlyLoss(num_classes=num_classes).to(device)
         loss_fun_change = DiceOnlyLoss(num_classes=2).to(device)
     elif loss_type == 'extended_triplet':
-        base_seg = CEDiceLoss(num_classes=num_classes)
+        # Per-pixel segmentation loss for change-aware weighting
         cfg = opt['model'].get('extended_triplet', {})
+        seg_loss_type = cfg.get('seg_loss', 'weighted_ce_dice')  # 'weighted_ce_dice' or 'focal_ce_dice'
+        
+        if seg_loss_type == 'focal_ce_dice':
+            # Focal CE + Dice (for extreme class imbalance)
+            base_seg = FocalCEDicePerPixel(
+                num_classes=num_classes,
+                class_weights=ce_weights,
+                gamma=cfg.get('focal_gamma', 2.0),
+                ignore_index=ignore_index,
+                lambda_focal=0.5,
+                lambda_dice=0.5,
+            )
+            logger.info(f"Using FocalCEDicePerPixel with gamma={cfg.get('focal_gamma', 2.0)}")
+        else:
+            # Weighted CE + Dice (recommended for most cases)
+            base_seg = WeightedCEDicePerPixel(
+                num_classes=num_classes,
+                class_weights=ce_weights,
+                ignore_index=ignore_index,
+                lambda_ce=0.5,
+                lambda_dice=0.5,
+                label_smoothing=0.0,
+            )
+            logger.info("Using WeightedCEDicePerPixel (recommended for rare classes)")
+        
         loss_fun = TripletChangeSegLoss(
             seg_loss_fn=base_seg,
             lambda_seg=cfg.get('lambda_seg', 1.0),
@@ -280,7 +340,10 @@ def main():
             lambda_ch=cfg.get('lambda_ch', 0.2),
             lambda_cpl=cfg.get('lambda_cpl', 0.5),
             T=cfg.get('T', 4.0),
-            margin=cfg.get('margin', 0.3)
+            margin=cfg.get('margin', 0.3),
+            boost=cfg.get('boost', 5.0),
+            ignore_index=ignore_index,
+            transition_weights=transition_weights,  # Pass transition weights for rebalancing
         ).to(device)
         loss_fun_change = loss_fun
     elif loss_type == 'seg_loss':
@@ -440,6 +503,34 @@ def main():
             train_epoch_mf1 = seg_scores['mf1']
             train_epoch_miou = seg_scores['miou']
             train_epoch_acc = seg_scores['acc']
+            
+            # Compute additional metrics on changed pixels only (aggregate from last batch for efficiency)
+            # Note: For full accuracy, we'd need to accumulate across all batches, but this gives a good estimate
+            if step > 0:  # Use last batch as representative
+                pred1_np = pred1.cpu().numpy()
+                pred2_np = pred2.cpu().numpy()
+                seg_t1_np = seg_t1.cpu().numpy()
+                seg_t2_np = seg_t2.cpu().numpy()
+                
+                # Metrics on changed pixels only
+                changed_metrics = compute_semantic_metrics_on_changed(
+                    pred1_np, pred2_np, seg_t1_np, seg_t2_np, num_classes, ignore_index
+                )
+                
+                # Per-class metrics
+                per_class_metrics = compute_per_class_metrics(
+                    pred1_np, pred2_np, seg_t1_np, seg_t2_np, num_classes, ignore_index
+                )
+                
+                # Top transition metrics (nvg_surf=1, low_veg=0, building=4)
+                top_transitions = [(1, 4), (0, 1), (1, 0), (0, 4)]  # nvg_surf→building, low_veg↔nvg_surf, low_veg→building
+                transition_metrics = compute_transition_metrics(
+                    pred1_np, pred2_np, seg_t1_np, seg_t2_np, top_transitions, num_classes, ignore_index
+                )
+            else:
+                changed_metrics = {'iou': 0.0, 'f1': 0.0, 'accuracy': 0.0}
+                per_class_metrics = {'iou_per_class': [0.0]*num_classes, 'f1_per_class': [0.0]*num_classes}
+                transition_metrics = {}
 
             # e-e: change metrics
             if (run_tp + run_fp + run_fn) > 0:
@@ -450,7 +541,9 @@ def main():
                 chg_f1 = chg_iou = chg_acc = 0.0
 
             avg_epoch_loss = epoch_loss / max(1, _train_total)
-            wandb.log({
+            
+            # Build comprehensive metrics dict
+            train_metrics = {
                 'train/epoch_loss': avg_epoch_loss,
                 'train/epoch_mF1_seg': train_epoch_mf1,
                 'train/epoch_mIoU_seg': train_epoch_miou,
@@ -458,8 +551,28 @@ def main():
                 'train/epoch_change_f1': chg_f1,
                 'train/epoch_change_iou': chg_iou,
                 'train/epoch_change_acc': chg_acc,
+                # Metrics on changed pixels only
+                'train/changed_pixels_iou': changed_metrics['iou'],
+                'train/changed_pixels_f1': changed_metrics['f1'],
+                'train/changed_pixels_acc': changed_metrics['accuracy'],
+                # Per-class metrics (key classes: building=4, nvg_surf=1, water=3, playground=5)
+                'train/class_building_iou': per_class_metrics['iou_per_class'][4] if len(per_class_metrics['iou_per_class']) > 4 else 0.0,
+                'train/class_building_f1': per_class_metrics['f1_per_class'][4] if len(per_class_metrics['f1_per_class']) > 4 else 0.0,
+                'train/class_nvg_surf_iou': per_class_metrics['iou_per_class'][1] if len(per_class_metrics['iou_per_class']) > 1 else 0.0,
+                'train/class_nvg_surf_f1': per_class_metrics['f1_per_class'][1] if len(per_class_metrics['f1_per_class']) > 1 else 0.0,
+                'train/class_water_iou': per_class_metrics['iou_per_class'][3] if len(per_class_metrics['iou_per_class']) > 3 else 0.0,
+                'train/class_water_f1': per_class_metrics['f1_per_class'][3] if len(per_class_metrics['f1_per_class']) > 3 else 0.0,
+                'train/class_playground_iou': per_class_metrics['iou_per_class'][5] if len(per_class_metrics['iou_per_class']) > 5 else 0.0,
+                'train/class_playground_f1': per_class_metrics['f1_per_class'][5] if len(per_class_metrics['f1_per_class']) > 5 else 0.0,
                 'epoch': epoch
-            })
+            }
+            
+            # Add transition metrics
+            for trans_key, trans_val in transition_metrics.items():
+                train_metrics[f'train/transition_{trans_key}_acc'] = trans_val['accuracy']
+                train_metrics[f'train/transition_{trans_key}_count'] = trans_val['count']
+            
+            wandb.log(train_metrics)
             logging.getLogger('base').info(
                 f"[Train] ep {epoch} loss {avg_epoch_loss:.5f} | seg mF1 {train_epoch_mf1:.4f} | chg F1 {chg_f1:.4f}"
             )
@@ -529,6 +642,30 @@ def main():
                 val_mf1 = val_scores['mf1']
                 val_miou = val_scores['miou']
                 val_acc = val_scores['acc']
+                
+                # Compute additional metrics on changed pixels only (aggregate from last batch)
+                if vstep > 0:
+                    p1_np = p1.cpu().numpy()
+                    p2_np = p2.cpu().numpy()
+                    y1_np = y1.cpu().numpy()
+                    y2_np = y2.cpu().numpy()
+                    
+                    val_changed_metrics = compute_semantic_metrics_on_changed(
+                        p1_np, p2_np, y1_np, y2_np, num_classes, ignore_index
+                    )
+                    
+                    val_per_class_metrics = compute_per_class_metrics(
+                        p1_np, p2_np, y1_np, y2_np, num_classes, ignore_index
+                    )
+                    
+                    top_transitions = [(1, 4), (0, 1), (1, 0), (0, 4)]
+                    val_transition_metrics = compute_transition_metrics(
+                        p1_np, p2_np, y1_np, y2_np, top_transitions, num_classes, ignore_index
+                    )
+                else:
+                    val_changed_metrics = {'iou': 0.0, 'f1': 0.0, 'accuracy': 0.0}
+                    val_per_class_metrics = {'iou_per_class': [0.0]*num_classes, 'f1_per_class': [0.0]*num_classes}
+                    val_transition_metrics = {}
 
                 # Change detection metrics
                 if (v_tp + v_fp + v_fn) > 0:
@@ -553,8 +690,26 @@ def main():
                     'val/epoch_change_f1': v_chg_f1,
                     'val/epoch_change_iou': v_chg_iou,
                     'val/epoch_change_acc': v_chg_acc,
+                    # Metrics on changed pixels only
+                    'val/changed_pixels_iou': val_changed_metrics['iou'],
+                    'val/changed_pixels_f1': val_changed_metrics['f1'],
+                    'val/changed_pixels_acc': val_changed_metrics['accuracy'],
+                    # Per-class metrics
+                    'val/class_building_iou': val_per_class_metrics['iou_per_class'][4] if len(val_per_class_metrics['iou_per_class']) > 4 else 0.0,
+                    'val/class_building_f1': val_per_class_metrics['f1_per_class'][4] if len(val_per_class_metrics['f1_per_class']) > 4 else 0.0,
+                    'val/class_nvg_surf_iou': val_per_class_metrics['iou_per_class'][1] if len(val_per_class_metrics['iou_per_class']) > 1 else 0.0,
+                    'val/class_nvg_surf_f1': val_per_class_metrics['f1_per_class'][1] if len(val_per_class_metrics['f1_per_class']) > 1 else 0.0,
+                    'val/class_water_iou': val_per_class_metrics['iou_per_class'][3] if len(val_per_class_metrics['iou_per_class']) > 3 else 0.0,
+                    'val/class_water_f1': val_per_class_metrics['f1_per_class'][3] if len(val_per_class_metrics['f1_per_class']) > 3 else 0.0,
+                    'val/class_playground_iou': val_per_class_metrics['iou_per_class'][5] if len(val_per_class_metrics['iou_per_class']) > 5 else 0.0,
+                    'val/class_playground_f1': val_per_class_metrics['f1_per_class'][5] if len(val_per_class_metrics['f1_per_class']) > 5 else 0.0,
                     'epoch': epoch
                 }
+                
+                # Add transition metrics
+                for trans_key, trans_val in val_transition_metrics.items():
+                    wandb_metrics[f'val/transition_{trans_key}_acc'] = trans_val['accuracy']
+                    wandb_metrics[f'val/transition_{trans_key}_count'] = trans_val['count']
                 
                 # Add per-class F1 and IoU if available
                 if 'f1_per_class' in val_scores:
