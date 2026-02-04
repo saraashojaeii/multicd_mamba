@@ -12,13 +12,13 @@ import argparse
 import numpy as np
 import torch
 from tqdm import tqdm
+from collections import OrderedDict
 
 # Add project root to path
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import data as Data
-from core.logger import parse as parse_cfg
 
 
 def precompute_stats(dataset, change_threshold=0.01, rare_classes=None, max_samples=None):
@@ -124,9 +124,15 @@ def main():
     parser.add_argument('--phase', type=str, default='train', help='Dataset phase (train/val/test)')
     args = parser.parse_args()
     
-    # Load config
+    # Load config directly (avoid parse_cfg which expects args object)
     print(f"Loading config from: {args.config}")
-    opt = parse_cfg(args.config)
+    with open(args.config, 'r') as f:
+        # Remove comments (lines starting with //)
+        json_str = ''
+        for line in f:
+            line = line.split('//')[0] + '\n'
+            json_str += line
+        opt = json.loads(json_str, object_pairs_hook=OrderedDict)
     
     # Get dataset config
     dataset_opt = opt['datasets'][args.phase]
