@@ -187,6 +187,7 @@ def main():
     
     # Initialize from-to transition matrix
     n_classes = opt['model']['n_classes']
+    ignore_index = opt.get('train', {}).get('ignore_index', 255)
     transition_matrix = np.zeros((n_classes, n_classes), dtype=np.int64)
     seg_metric = ConfuseMatrixMeter(n_class=n_classes)
     had_seg_pred = False
