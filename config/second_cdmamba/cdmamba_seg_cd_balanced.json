@@ -1,7 +1,12 @@
 {
   "name": "cdmamba_seg_cd_balanced",
+  "phase": "train",
   "gpu_ids": [0],
   
+  "wandb": {
+    "project": "BuildingCD_mamba_based"
+  },
+
   "path_cd": {
     "log": "/root/home/pvc/01_change_detection/Building_changedetection_job/experiments/logs",
     "result": "/root/home/pvc/01_change_detection/Building_changedetection_job/experiments/results",
@@ -92,10 +97,5 @@
       "precompute_stats": true,
       "max_precompute": 1000
     }
-  },
-  
-  "wandb": {
-    "project": "change-detection-balanced",
-    "entity": null
   }
 }
