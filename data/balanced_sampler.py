@@ -8,6 +8,8 @@ Oversamples patches with:
 
 import torch
 import numpy as np
+import json
+import os
 from torch.utils.data import Sampler
 from typing import List, Optional
 
@@ -32,6 +34,7 @@ class BalancedChangeSampler(Sampler):
         oversample_factor: float = 2.0,
         precompute_stats: bool = True,
         max_precompute: Optional[int] = None,
+        stats_file: Optional[str] = None,
     ):
         self.dataset = dataset
         self.change_threshold = change_threshold
@@ -39,13 +42,18 @@ class BalancedChangeSampler(Sampler):
         self.oversample_factor = oversample_factor
         self.precompute_stats = precompute_stats
         self.max_precompute = max_precompute
+        self.stats_file = stats_file
         
         self.num_samples = len(dataset)
         self.high_change_indices = []
         self.rare_class_indices = []
         self.regular_indices = []
         
-        if self.precompute_stats:
+        # Load from file if provided
+        if self.stats_file is not None and os.path.exists(self.stats_file):
+            print(f"[BalancedChangeSampler] Loading precomputed stats from: {self.stats_file}")
+            self._load_stats_from_file()
+        elif self.precompute_stats:
             self._precompute_sample_stats()
         else:
             # Without precomputation, treat all samples as regular
@@ -107,6 +115,34 @@ class BalancedChangeSampler(Sampler):
         print(f"  High change (>{self.change_threshold*100:.1f}%): {len(self.high_change_indices)} samples")
         print(f"  Rare classes: {len(self.rare_class_indices)} samples")
         print(f"  Regular: {len(self.regular_indices)} samples")
+    
+    def _load_stats_from_file(self):
+        """Load precomputed statistics from JSON file."""
+        try:
+            with open(self.stats_file, 'r') as f:
+                stats = json.load(f)
+            
+            # Validate stats
+            if stats.get('num_samples', 0) != self.num_samples:
+                print(f"Warning: Stats file has {stats.get('num_samples')} samples, dataset has {self.num_samples}")
+                print("Falling back to precomputation...")
+                self._precompute_sample_stats()
+                return
+            
+            # Load indices
+            self.high_change_indices = stats.get('high_change_indices', [])
+            self.rare_class_indices = stats.get('rare_class_indices', [])
+            self.regular_indices = stats.get('regular_indices', [])
+            
+            print(f"  Loaded statistics:")
+            print(f"    High change: {len(self.high_change_indices)} samples")
+            print(f"    Rare classes: {len(self.rare_class_indices)} samples")
+            print(f"    Regular: {len(self.regular_indices)} samples")
+            
+        except Exception as e:
+            print(f"Error loading stats file: {e}")
+            print("Falling back to precomputation...")
+            self._precompute_sample_stats()
     
     def __iter__(self):
         """Generate indices with oversampling of high-change and rare-class patches."""

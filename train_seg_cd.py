@@ -212,6 +212,7 @@ def main():
                     oversample_factor=sampler_cfg.get('oversample_factor', 2.0),
                     precompute_stats=sampler_cfg.get('precompute_stats', True),
                     max_precompute=sampler_cfg.get('max_precompute', 1000),
+                    stats_file=sampler_cfg.get('stats_file', None),  # Load precomputed stats if provided
                 )
                 logger.info(f"Using BalancedChangeSampler with change_threshold={sampler_cfg.get('change_threshold', 0.01)}")
                 # Create dataloader with custom sampler (note: shuffle must be False when using sampler)
