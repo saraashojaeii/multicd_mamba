@@ -341,7 +341,7 @@ def main():
     scd_mean_iou = scd_sek = scd_score = sc_precision = sc_recall = f_scd = None
     if had_seg_pred:
         # Get the full semantic confusion matrix (combined T1 and T2)
-        seg_cm = seg_metric.confusion_matrix
+        seg_cm = seg_metric.sum  # ConfuseMatrixMeter stores confusion matrix in self.sum
         
         # Build binary change confusion matrix from semantic confusion
         # Following Eval_SCD.py logic:
