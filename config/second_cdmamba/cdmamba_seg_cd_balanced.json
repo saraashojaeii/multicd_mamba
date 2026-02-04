@@ -89,7 +89,7 @@
       "eta_min": 1e-6
     },
     
-    "use_balanced_sampler": false,
+    "use_balanced_sampler": true,
     "balanced_sampler": {
       "change_threshold": 0.01,
       "rare_classes": [3, 5],
