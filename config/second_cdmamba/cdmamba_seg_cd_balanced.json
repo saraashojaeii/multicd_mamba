@@ -91,11 +91,8 @@
     
     "use_balanced_sampler": true,
     "balanced_sampler": {
-      "change_threshold": 0.01,
-      "rare_classes": [3, 5],
-      "oversample_factor": 2.0,
-      "precompute_stats": true,
-      "max_precompute": 1000
+      "precompute_stats": false,
+      "stats_file": "config/second_cdmamba/sampler_stats/train_train_sampler_stats.json"
     }
   }
 }
