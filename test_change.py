@@ -503,20 +503,126 @@ def main():
     logger.info("=" * 60)
     logger.info(f"Results saved to {test_result_path}")
     
-    # Save transition matrix to file
+    # Save all test metrics to JSON file
     import json
-    transition_data = {
-        'matrix_counts': transition_matrix.tolist(),
-        'matrix_percentages': transition_matrix_pct_global.tolist(),
-        'matrix_percentages_global': transition_matrix_pct_global.tolist(),
-        'matrix_percentages_row': transition_matrix_pct_row.tolist(),
-        'class_names': class_names,
-        'total_pixels': int(total_pixels),
-        'change_pixel_ratio': float(change_pix_sum / (total_pix_sum + 1e-8))
+    
+    # Compile all metrics
+    all_metrics = {
+        'binary_change_detection': {
+            'precision': float(test_prec),
+            'recall': float(test_rec),
+            'f1': float(test_f1),
+            'iou': float(test_iou),
+            'accuracy': float(test_acc),
+            'sek': float(test_sek)
+        },
+        'semantic_segmentation': {
+            'precision_macro': float(seg_prec_macro) if seg_prec_macro is not None else None,
+            'recall_macro': float(seg_rec_macro) if seg_rec_macro is not None else None,
+            'f1': float(seg_f1) if seg_f1 is not None else None,
+            'iou': float(seg_iou) if seg_iou is not None else None,
+            'accuracy': float(seg_acc) if seg_acc is not None else None,
+            'sek': float(seg_sek) if seg_sek is not None else None
+        },
+        'eval_scd_metrics': {
+            'mean_iou': float(scd_mean_iou) if scd_mean_iou is not None else None,
+            'sek': float(scd_sek) if scd_sek is not None else None,
+            'score': float(scd_score) if scd_score is not None else None,
+            'sc_precision': float(sc_precision) if sc_precision is not None else None,
+            'sc_recall': float(sc_recall) if sc_recall is not None else None,
+            'f_scd': float(f_scd) if f_scd is not None else None
+        },
+        'changed_pixels_only': changed_metrics if changed_metrics else None,
+        'per_class_metrics': per_class_metrics if per_class_metrics else None,
+        'transition_metrics': transition_metrics if transition_metrics else None,
+        'transition_matrix': {
+            'matrix_counts': transition_matrix.tolist(),
+            'matrix_percentages_global': transition_matrix_pct_global.tolist(),
+            'matrix_percentages_row': transition_matrix_pct_row.tolist(),
+            'class_names': class_names,
+            'total_pixels': int(total_pixels),
+            'change_pixel_ratio': float(change_pix_sum / (total_pix_sum + 1e-8))
+        }
     }
+    
+    # Save comprehensive metrics
+    metrics_path = os.path.join(test_result_path, 'test_metrics.json')
+    with open(metrics_path, 'w') as f:
+        json.dump(all_metrics, f, indent=2)
+    logger.info(f"Test metrics saved to {metrics_path}")
+    
+    # Also save transition matrix separately for backward compatibility
+    transition_data = all_metrics['transition_matrix']
     with open(os.path.join(test_result_path, 'transition_matrix.json'), 'w') as f:
         json.dump(transition_data, f, indent=2)
     logger.info(f"Transition matrix saved to {os.path.join(test_result_path, 'transition_matrix.json')}")
+    
+    # Print comprehensive metrics summary
+    logger.info("\n" + "=" * 80)
+    logger.info("FINAL TEST METRICS SUMMARY")
+    logger.info("=" * 80)
+    
+    logger.info("\n📊 BINARY CHANGE DETECTION:")
+    logger.info("-" * 80)
+    logger.info(f"  Precision:  {test_prec:.4f} ({test_prec*100:.2f}%)")
+    logger.info(f"  Recall:     {test_rec:.4f} ({test_rec*100:.2f}%)")
+    logger.info(f"  F1-Score:   {test_f1:.4f} ({test_f1*100:.2f}%)")
+    logger.info(f"  IoU:        {test_iou:.4f} ({test_iou*100:.2f}%)")
+    logger.info(f"  Accuracy:   {test_acc:.4f} ({test_acc*100:.2f}%)")
+    logger.info(f"  SeK:        {test_sek:.4f} ({test_sek*100:.2f}%)")
+    
+    if had_seg_pred:
+        logger.info("\n🎯 SEMANTIC SEGMENTATION (All Pixels):")
+        logger.info("-" * 80)
+        logger.info(f"  Precision (macro): {seg_prec_macro:.4f} ({seg_prec_macro*100:.2f}%)")
+        logger.info(f"  Recall (macro):    {seg_rec_macro:.4f} ({seg_rec_macro*100:.2f}%)")
+        logger.info(f"  F1-Score:          {seg_f1:.4f} ({seg_f1*100:.2f}%)")
+        logger.info(f"  mIoU:              {seg_iou:.4f} ({seg_iou*100:.2f}%)")
+        logger.info(f"  Accuracy:          {seg_acc:.4f} ({seg_acc*100:.2f}%)")
+        logger.info(f"  SeK:               {seg_sek:.4f} ({seg_sek*100:.2f}%)")
+    
+    if scd_mean_iou is not None:
+        logger.info("\n🏆 EVAL_SCD METRICS (Official SCD Benchmark):")
+        logger.info("-" * 80)
+        logger.info(f"  Mean IoU:       {scd_mean_iou:.4f} ({scd_mean_iou*100:.2f}%)")
+        logger.info(f"  SeK:            {scd_sek:.4f} ({scd_sek*100:.2f}%)")
+        logger.info(f"  Score:          {scd_score:.4f} ({scd_score*100:.2f}%) [0.3*IoU + 0.7*SeK]")
+        logger.info(f"  SC_Precision:   {sc_precision:.4f} ({sc_precision*100:.2f}%)")
+        logger.info(f"  SC_Recall:      {sc_recall:.4f} ({sc_recall*100:.2f}%)")
+        logger.info(f"  F_scd:          {f_scd:.4f} ({f_scd*100:.2f}%)")
+    
+    if changed_metrics:
+        logger.info("\n🔄 CHANGED PIXELS ONLY:")
+        logger.info("-" * 80)
+        logger.info(f"  IoU:        {changed_metrics['iou']:.4f} ({changed_metrics['iou']*100:.2f}%)")
+        logger.info(f"  F1-Score:   {changed_metrics['f1']:.4f} ({changed_metrics['f1']*100:.2f}%)")
+        logger.info(f"  Accuracy:   {changed_metrics['accuracy']:.4f} ({changed_metrics['accuracy']*100:.2f}%)")
+    
+    if per_class_metrics:
+        logger.info("\n📋 PER-CLASS METRICS (Key Classes):")
+        logger.info("-" * 80)
+        key_classes = {
+            0: 'low_veg',
+            1: 'nvg_surf', 
+            3: 'water',
+            4: 'building',
+            5: 'playground'
+        }
+        for cls_id, cls_name in key_classes.items():
+            if cls_id < len(per_class_metrics['iou_per_class']):
+                iou = per_class_metrics['iou_per_class'][cls_id]
+                f1 = per_class_metrics['f1_per_class'][cls_id]
+                logger.info(f"  {cls_name:>12}: IoU={iou:.4f} ({iou*100:.2f}%), F1={f1:.4f} ({f1*100:.2f}%)")
+    
+    if transition_metrics:
+        logger.info("\n🔀 TOP TRANSITION METRICS:")
+        logger.info("-" * 80)
+        for trans_key, trans_val in transition_metrics.items():
+            logger.info(f"  {trans_key:>12}: Acc={trans_val['accuracy']:.4f} ({trans_val['accuracy']*100:.2f}%), Count={trans_val['count']}")
+    
+    logger.info("\n" + "=" * 80)
+    logger.info(f"📁 All metrics saved to: {metrics_path}")
+    logger.info("=" * 80 + "\n")
 
     if use_wandb:
         # Log scalar metrics with requested suffixes
