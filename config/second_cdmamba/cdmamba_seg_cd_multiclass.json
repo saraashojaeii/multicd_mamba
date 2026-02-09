@@ -65,6 +65,13 @@
       "kl_warmup_epochs": 5
     },
     "use_change_head": true,
+    "use_change_gating": true,
+    "change_gate_alpha": 1.0,
+    "change_gate_beta": 0.2,
+    "change_gate_mode": "additive",
+    "use_interaction_block": true,
+    "interaction_num_heads": 4,
+    "interaction_use_mamba": false,
     "init_filters" : 16,
     "n_classes" : 6,
     "conv_mode" : "deepwise",

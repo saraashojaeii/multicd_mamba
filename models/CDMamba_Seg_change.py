@@ -71,6 +71,109 @@ class CrossTemporalFusion(nn.Module):
         x = torch.cat([f1, f2, adiff, diff], dim=1)
         return self.fuse(x)
 
+class SemanticChangeInteractionBlock(nn.Module):
+    """
+    Lightweight semantic-change interaction at bottleneck.
+    Uses cross-attention between semantic tokens (T1, T2) and change tokens (fused).
+    Minimal compute: single attention block with efficient implementation.
+    """
+    def __init__(self, channels: int, num_heads: int = 4, use_mamba: bool = False):
+        super().__init__()
+        self.channels = channels
+        self.num_heads = num_heads
+        self.use_mamba = use_mamba
+        
+        # Layer norms
+        self.norm_sem = nn.LayerNorm(channels)
+        self.norm_chg = nn.LayerNorm(channels)
+        
+        if use_mamba:
+            # Mamba-style mixing (lightweight alternative to attention)
+            self.sem_to_chg = ConvMamba(d_model=channels, d_state=16, d_conv=4, expand=2, bimamba_type="v2")
+            self.chg_to_sem = ConvMamba(d_model=channels, d_state=16, d_conv=4, expand=2, bimamba_type="v2")
+        else:
+            # Cross-attention: semantic attends to change, change attends to semantic
+            self.sem_to_chg_attn = nn.MultiheadAttention(channels, num_heads, batch_first=True)
+            self.chg_to_sem_attn = nn.MultiheadAttention(channels, num_heads, batch_first=True)
+        
+        # FFN for refinement
+        self.ffn_sem = nn.Sequential(
+            nn.Linear(channels, channels * 2),
+            nn.GELU(),
+            nn.Linear(channels * 2, channels),
+        )
+        self.ffn_chg = nn.Sequential(
+            nn.Linear(channels, channels * 2),
+            nn.GELU(),
+            nn.Linear(channels * 2, channels),
+        )
+        
+        self.norm_ffn_sem = nn.LayerNorm(channels)
+        self.norm_ffn_chg = nn.LayerNorm(channels)
+    
+    def forward(self, sem_t1: torch.Tensor, sem_t2: torch.Tensor, change_fused: torch.Tensor):
+        """
+        Args:
+            sem_t1: [B, C, H, W] - T1 semantic features
+            sem_t2: [B, C, H, W] - T2 semantic features
+            change_fused: [B, C, H, W] - fused change features
+        Returns:
+            Enhanced (sem_t1, sem_t2, change_fused)
+        """
+        B, C, H, W = sem_t1.shape
+        
+        # Flatten to tokens: [B, C, H, W] -> [B, H*W, C]
+        sem_t1_flat = sem_t1.flatten(2).transpose(1, 2)  # [B, HW, C]
+        sem_t2_flat = sem_t2.flatten(2).transpose(1, 2)
+        chg_flat = change_fused.flatten(2).transpose(1, 2)
+        
+        # Average semantic tokens from T1 and T2
+        sem_avg = (sem_t1_flat + sem_t2_flat) / 2.0  # [B, HW, C]
+        
+        # Normalize
+        sem_norm = self.norm_sem(sem_avg)
+        chg_norm = self.norm_chg(chg_flat)
+        
+        if self.use_mamba:
+            # Mamba-style mixing (reshape needed for ConvMamba)
+            sem_norm_2d = sem_norm.transpose(1, 2).reshape(B, C, H, W)
+            chg_norm_2d = chg_norm.transpose(1, 2).reshape(B, C, H, W)
+            
+            # Mix: semantic informed by change
+            sem_enhanced_2d = sem_norm_2d + self.chg_to_sem(chg_norm_2d)
+            # Mix: change informed by semantic
+            chg_enhanced_2d = chg_norm_2d + self.sem_to_chg(sem_norm_2d)
+            
+            sem_enhanced = sem_enhanced_2d.flatten(2).transpose(1, 2)
+            chg_enhanced = chg_enhanced_2d.flatten(2).transpose(1, 2)
+        else:
+            # Cross-attention: semantic queries change context
+            sem_enhanced, _ = self.sem_to_chg_attn(
+                query=sem_norm, key=chg_norm, value=chg_norm
+            )
+            sem_enhanced = sem_avg + sem_enhanced  # Residual
+            
+            # Cross-attention: change queries semantic context
+            chg_enhanced, _ = self.chg_to_sem_attn(
+                query=chg_norm, key=sem_norm, value=sem_norm
+            )
+            chg_enhanced = chg_flat + chg_enhanced  # Residual
+        
+        # FFN refinement
+        sem_enhanced = sem_enhanced + self.ffn_sem(self.norm_ffn_sem(sem_enhanced))
+        chg_enhanced = chg_enhanced + self.ffn_chg(self.norm_ffn_chg(chg_enhanced))
+        
+        # Reshape back to feature maps: [B, HW, C] -> [B, C, H, W]
+        sem_enhanced = sem_enhanced.transpose(1, 2).reshape(B, C, H, W)
+        chg_enhanced = chg_enhanced.transpose(1, 2).reshape(B, C, H, W)
+        
+        # Apply enhancement to both T1 and T2 semantic features
+        sem_t1_out = sem_t1 + sem_enhanced
+        sem_t2_out = sem_t2 + sem_enhanced
+        change_out = change_fused + chg_enhanced
+        
+        return sem_t1_out, sem_t2_out, change_out
+
 class ModifiedSRCMLayer(nn.Module):
     def __init__(self, input_dim, output_dim, d_state=16, d_conv=4, expand=2, groups=4):
         super().__init__()
@@ -203,10 +306,22 @@ class CDMamba_seg_cd(nn.Module):
             blocks_up: tuple = (1, 1, 1),
             up_conv_mode: str = "deepwise",
             upsample_mode: UpsampleMode | str = UpsampleMode.NONTRAINABLE,
+            use_change_gating: bool = True,
+            change_gate_alpha: float = 1.0,
+            change_gate_beta: float = 0.2,
+            change_gate_mode: str = "additive",
+            use_interaction_block: bool = True,
+            interaction_num_heads: int = 4,
+            interaction_use_mamba: bool = False,
     ):
         super().__init__()
         self.num_classes = num_classes
         self.use_change_head = use_change_head
+        self.use_change_gating = use_change_gating
+        self.change_gate_alpha = change_gate_alpha
+        self.change_gate_beta = change_gate_beta
+        self.change_gate_mode = change_gate_mode  # "additive" or "multiplicative"
+        self.use_interaction_block = use_interaction_block
 
         if spatial_dims not in (2, 3):
             raise ValueError("`spatial_dims` can only be 2 or 3.")
@@ -250,6 +365,14 @@ class CDMamba_seg_cd(nn.Module):
         ])
         # Fusion at bottleneck level
         self.fuse_bottleneck = CrossTemporalFusion(bottleneck_channels)
+        
+        # Semantic-Change Interaction Block at bottleneck
+        if self.use_interaction_block:
+            self.interaction_block = SemanticChangeInteractionBlock(
+                channels=bottleneck_channels,
+                num_heads=interaction_num_heads,
+                use_mamba=interaction_use_mamba
+            )
 
         # --- SEGMENTATION HEADS ---
         # Each head outputs num_classes channels
@@ -412,6 +535,15 @@ class CDMamba_seg_cd(nn.Module):
                 fused_i = self.fuse_scales[i](x1_i, x2_i)
                 down_x_fused.append(fused_i)
             
+            # Fuse bottleneck features for change path
+            fused_latent = self.fuse_bottleneck(x1_latent, x2_latent)
+            
+            # Semantic-Change Interaction at bottleneck
+            if self.use_interaction_block:
+                x1_latent, x2_latent, fused_latent = self.interaction_block(
+                    x1_latent, x2_latent, fused_latent
+                )
+            
             # Decode each path
             down_x_fused.reverse()
             down_x1.reverse()
@@ -421,16 +553,53 @@ class CDMamba_seg_cd(nn.Module):
             seg1 = self._decode_with_layers(x1_latent, down_x1, self.up_samples_seg_t1, self.srcm_decoder_layers_seg_t1)
             seg2 = self._decode_with_layers(x2_latent, down_x2, self.up_samples_seg_t2, self.srcm_decoder_layers_seg_t2)
             
-            seg_logits_t1 = self.seg_head_t1(seg1)
-            seg_logits_t2 = self.seg_head_t2(seg2)
-            
             if self.use_change_head:
-                # Fuse bottleneck and decode dedicated change path
-                fused_latent = self.fuse_bottleneck(x1_latent, x2_latent)
+                # Decode dedicated change path
                 chg_dec = self._decode_with_layers(fused_latent, down_x_fused, self.up_samples_change, self.srcm_decoder_layers_change)
                 change_logits = self.change_head(chg_dec)
+                
+                # Change-guided gating: force semantic heads to focus on change-relevant regions
+                if self.use_change_gating:
+                    # Compute soft change probability mask
+                    if change_logits.size(1) == 2:
+                        # 2-channel output: [no-change, change]
+                        change_prob = F.softmax(change_logits, dim=1)[:, 1:2]  # [B, 1, H, W]
+                    else:
+                        # 1-channel output: sigmoid
+                        change_prob = torch.sigmoid(change_logits)  # [B, 1, H, W]
+                    
+                    # Resize change_prob to match decoder feature spatial size
+                    if change_prob.shape[2:] != seg1.shape[2:]:
+                        change_prob = F.interpolate(
+                            change_prob, 
+                            size=seg1.shape[2:], 
+                            mode='bilinear' if self.spatial_dims == 2 else 'trilinear',
+                            align_corners=False
+                        )
+                    
+                    # Apply gating to decoder features before segmentation heads
+                    if self.change_gate_mode == "additive":
+                        # Additive gating: dec_gated = dec * (1 + alpha * change_prob)
+                        # Amplifies features in changed regions
+                        seg1_gated = seg1 * (1.0 + self.change_gate_alpha * change_prob)
+                        seg2_gated = seg2 * (1.0 + self.change_gate_alpha * change_prob)
+                    else:  # multiplicative
+                        # Multiplicative gating: dec_gated = dec * (beta + (1-beta) * change_prob)
+                        # Suppresses unchanged regions more strongly (beta ~ 0.2)
+                        gate = self.change_gate_beta + (1.0 - self.change_gate_beta) * change_prob
+                        seg1_gated = seg1 * gate
+                        seg2_gated = seg2 * gate
+                    
+                    seg_logits_t1 = self.seg_head_t1(seg1_gated)
+                    seg_logits_t2 = self.seg_head_t2(seg2_gated)
+                else:
+                    seg_logits_t1 = self.seg_head_t1(seg1)
+                    seg_logits_t2 = self.seg_head_t2(seg2)
+                
                 return seg_logits_t1, seg_logits_t2, change_logits
             else:
+                seg_logits_t1 = self.seg_head_t1(seg1)
+                seg_logits_t2 = self.seg_head_t2(seg2)
                 return seg_logits_t1, seg_logits_t2
 
 if __name__ == "__main__":

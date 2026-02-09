@@ -38,7 +38,7 @@ from core.logger import setup_logger, dict2str, dict_to_nonedict
 from misc.metric_tools import ConfuseMatrixMeter
 from misc.torchutils import get_scheduler, save_network
 from models.loss import *
-from core.metrics import compute_semantic_metrics_on_changed, compute_per_class_metrics, compute_transition_metrics
+from core.metrics import compute_semantic_metrics_on_changed, compute_per_class_metrics, compute_transition_metrics, compute_unchanged_stability_metrics
 
 # ----------------------------- helpers ----------------------------- #
 def set_all_seeds(seed: int | None):
@@ -203,6 +203,12 @@ def main():
     all_pred_t2_all = []
     all_gt_t1_all = []
     all_gt_t2_all = []
+    
+    # Accumulators for unchanged stability metrics
+    all_pred_t1_unchanged = []
+    all_pred_t2_unchanged = []
+    all_gt_t1_unchanged = []
+    all_gt_t2_unchanged = []
 
     _max_test = args.max_test_batches
     _test_total = min(len(test_loader), _max_test) if _max_test > 0 else len(test_loader)
@@ -278,6 +284,14 @@ def main():
                     all_pred_t2_changed.append(p2_np[mask_chg])
                     all_gt_t1_changed.append(y1_np[mask_chg])
                     all_gt_t2_changed.append(y2_np[mask_chg])
+                
+                # Store unchanged pixels for stability metrics
+                unchanged_mask = (~changed_mask) & valid_mask
+                if unchanged_mask.any():
+                    all_pred_t1_unchanged.append(p1_np[unchanged_mask])
+                    all_pred_t2_unchanged.append(p2_np[unchanged_mask])
+                    all_gt_t1_unchanged.append(y1_np[unchanged_mask])
+                    all_gt_t2_unchanged.append(y2_np[unchanged_mask])
                 
                 # Store all pixels
                 valid_t1 = (y1_np != ignore_index)
@@ -423,6 +437,25 @@ def main():
                 pred_t1_chg, pred_t2_chg, gt_t1_chg, gt_t2_chg, n_classes, ignore_index
             )
         
+        # Compute unchanged stability metrics
+        unchanged_stability_metrics = None
+        if all_pred_t1_unchanged and all_pred_t2_unchanged:
+            pred_t1_unch = np.concatenate(all_pred_t1_unchanged)
+            pred_t2_unch = np.concatenate(all_pred_t2_unchanged)
+            gt_t1_unch = np.concatenate(all_gt_t1_unchanged)
+            gt_t2_unch = np.concatenate(all_gt_t2_unchanged)
+            
+            # Reshape to [1, N] to match expected input
+            pred_t1_unch = pred_t1_unch.reshape(1, -1)
+            pred_t2_unch = pred_t2_unch.reshape(1, -1)
+            gt_t1_unch = gt_t1_unch.reshape(1, -1)
+            gt_t2_unch = gt_t2_unch.reshape(1, -1)
+            
+            unchanged_stability_metrics = compute_unchanged_stability_metrics(
+                pred_t1_unch, pred_t2_unch, gt_t1_unch, gt_t2_unch, n_classes, ignore_index,
+                pred_probs_t1=None, pred_probs_t2=None, background_class=0
+            )
+        
         # Compute per-class metrics (all pixels)
         if all_pred_t1_all and all_pred_t2_all:
             pred_t1_all = np.concatenate(all_pred_t1_all).reshape(1, -1)
@@ -472,6 +505,25 @@ def main():
         logger.info("=" * 60)
     
     logger.info(f"Change pixel ratio (gt change): { (change_pix_sum / (total_pix_sum + 1e-8)) :.6f}")
+    
+    # Log unchanged stability metrics
+    if unchanged_stability_metrics:
+        logger.info("\nUnchanged Region Stability Metrics:")
+        logger.info("=" * 60)
+        logger.info(f"  Overall Stability:       {unchanged_stability_metrics['stability']*100:.2f}%")
+        logger.info(f"  Stable Pixels:           {unchanged_stability_metrics['stable_pixel_count']:,}")
+        logger.info(f"  Unstable Pixels:         {unchanged_stability_metrics['unstable_pixel_count']:,}")
+        logger.info(f"  Total Unchanged Pixels:  {unchanged_stability_metrics['num_unchanged_pixels']:,}")
+        logger.info(f"  Unchanged FP Rate:       {unchanged_stability_metrics['unchanged_fp_rate']*100:.2f}%")
+        if unchanged_stability_metrics['unchanged_entropy'] > 0:
+            logger.info(f"  Prediction Entropy:      {unchanged_stability_metrics['unchanged_entropy']:.4f}")
+        
+        # Log per-class stability
+        logger.info("\n  Per-Class Stability:")
+        for i, stability in enumerate(unchanged_stability_metrics['stability_per_class']):
+            if i < len(class_names):
+                logger.info(f"    {class_names[i]:>12}: {stability*100:>6.2f}%")
+        logger.info("=" * 60)
     
     # Log transition matrix
     logger.info("\nFrom-To Transition Matrix (global %):")
@@ -533,6 +585,7 @@ def main():
             'f_scd': float(f_scd) if f_scd is not None else None
         },
         'changed_pixels_only': changed_metrics if changed_metrics else None,
+        'unchanged_stability': unchanged_stability_metrics if unchanged_stability_metrics else None,
         'per_class_metrics': per_class_metrics if per_class_metrics else None,
         'transition_metrics': transition_metrics if transition_metrics else None,
         'transition_matrix': {

@@ -279,3 +279,108 @@ def compute_transition_metrics(pred_t1, pred_t2, gt_t1, gt_t2, transitions, num_
         }
     
     return results
+
+
+def compute_unchanged_stability_metrics(pred_t1, pred_t2, gt_t1, gt_t2, num_classes, ignore_index=255, 
+                                       pred_probs_t1=None, pred_probs_t2=None, background_class=0):
+    """Compute semantic stability metrics on unchanged pixels.
+    
+    This metric quantifies how consistent the model's predictions are in unchanged regions,
+    which is critical for semantic change detection. High stability means the model correctly
+    predicts the same class for both T1 and T2 in unchanged areas.
+    
+    Args:
+        pred_t1, pred_t2: [B,H,W] predicted class indices
+        gt_t1, gt_t2: [B,H,W] ground truth class indices
+        num_classes: number of semantic classes
+        ignore_index: index to ignore
+        pred_probs_t1, pred_probs_t2: [B,C,H,W] optional prediction probabilities for entropy
+        background_class: class index for background (default 0)
+    
+    Returns:
+        dict with:
+            - stability: overall stability (% of unchanged pixels with consistent predictions)
+            - stability_per_class: per-class stability
+            - unchanged_fp_rate: false positive rate in unchanged regions (non-background predictions)
+            - unchanged_entropy: average prediction entropy in unchanged regions (if probs provided)
+            - num_unchanged_pixels: total number of unchanged pixels evaluated
+    """
+    # Identify unchanged pixels in ground truth
+    unchanged_mask_gt = (gt_t1 == gt_t2)
+    valid_mask = (gt_t1 != ignore_index) & (gt_t2 != ignore_index)
+    unchanged_mask = unchanged_mask_gt & valid_mask
+    
+    if not unchanged_mask.any():
+        return {
+            'stability': 0.0,
+            'stability_per_class': [0.0] * num_classes,
+            'unchanged_fp_rate': 0.0,
+            'unchanged_entropy': 0.0,
+            'num_unchanged_pixels': 0,
+        }
+    
+    # Extract predictions on unchanged pixels
+    pred_t1_unch = pred_t1[unchanged_mask]
+    pred_t2_unch = pred_t2[unchanged_mask]
+    gt_unch = gt_t1[unchanged_mask]  # GT is same for T1 and T2 in unchanged regions
+    
+    # Overall stability: percentage where pred_t1 == pred_t2
+    stable_predictions = (pred_t1_unch == pred_t2_unch)
+    overall_stability = stable_predictions.sum() / len(pred_t1_unch)
+    
+    # Per-class stability
+    stability_per_class = []
+    for cls in range(num_classes):
+        cls_mask = (gt_unch == cls)
+        if cls_mask.any():
+            cls_stable = stable_predictions[cls_mask].sum() / cls_mask.sum()
+            stability_per_class.append(float(cls_stable))
+        else:
+            stability_per_class.append(0.0)
+    
+    # Unchanged false positive rate: % of unchanged pixels predicted as non-background
+    # (assuming background_class is the "no change" class)
+    # This measures spurious change predictions in unchanged areas
+    pred_non_bg_t1 = (pred_t1_unch != background_class).sum()
+    pred_non_bg_t2 = (pred_t2_unch != background_class).sum()
+    gt_non_bg = (gt_unch != background_class).sum()
+    
+    # FP: predicted non-background when GT is background
+    gt_bg_mask = (gt_unch == background_class)
+    if gt_bg_mask.any():
+        fp_t1 = (pred_t1_unch[gt_bg_mask] != background_class).sum()
+        fp_t2 = (pred_t2_unch[gt_bg_mask] != background_class).sum()
+        unchanged_fp_rate = (fp_t1 + fp_t2) / (2 * gt_bg_mask.sum())
+    else:
+        unchanged_fp_rate = 0.0
+    
+    # Prediction entropy in unchanged regions (if probabilities provided)
+    unchanged_entropy = 0.0
+    if pred_probs_t1 is not None and pred_probs_t2 is not None:
+        # Extract probabilities for unchanged pixels
+        # pred_probs shape: [B,C,H,W] -> need to extract [N,C] for unchanged pixels
+        B, C, H, W = pred_probs_t1.shape
+        
+        # Flatten spatial dimensions and extract unchanged pixels
+        probs_t1_flat = pred_probs_t1.reshape(B, C, -1).transpose(0, 2, 1).reshape(-1, C)  # [B*H*W, C]
+        probs_t2_flat = pred_probs_t2.reshape(B, C, -1).transpose(0, 2, 1).reshape(-1, C)
+        unchanged_mask_flat = unchanged_mask.reshape(-1)
+        
+        probs_t1_unch = probs_t1_flat[unchanged_mask_flat]  # [N_unch, C]
+        probs_t2_unch = probs_t2_flat[unchanged_mask_flat]
+        
+        # Compute entropy: -sum(p * log(p))
+        eps = 1e-8
+        entropy_t1 = -(probs_t1_unch * np.log(probs_t1_unch + eps)).sum(axis=1).mean()
+        entropy_t2 = -(probs_t2_unch * np.log(probs_t2_unch + eps)).sum(axis=1).mean()
+        unchanged_entropy = (entropy_t1 + entropy_t2) / 2.0
+    
+    return {
+        'stability': float(overall_stability),
+        'stability_per_class': stability_per_class,
+        'unchanged_fp_rate': float(unchanged_fp_rate),
+        'unchanged_entropy': float(unchanged_entropy),
+        'num_unchanged_pixels': int(unchanged_mask.sum()),
+        'stable_pixel_count': int(stable_predictions.sum()),
+        'unstable_pixel_count': int((~stable_predictions).sum()),
+    }

@@ -212,9 +212,19 @@ def main():
                     oversample_factor=sampler_cfg.get('oversample_factor', 2.0),
                     precompute_stats=sampler_cfg.get('precompute_stats', True),
                     max_precompute=sampler_cfg.get('max_precompute', 1000),
-                    stats_file=sampler_cfg.get('stats_file', None),  # Load precomputed stats if provided
+                    stats_file=sampler_cfg.get('stats_file', None),
+                    batch_balance_ratio=sampler_cfg.get('batch_balance_ratio', 0.5),
+                    use_batch_balance=sampler_cfg.get('use_batch_balance', True),
+                    epoch_schedule_oversample=sampler_cfg.get('epoch_schedule_oversample', True),
+                    oversample_warmup_epochs=sampler_cfg.get('oversample_warmup_epochs', 10),
+                    min_oversample_factor=sampler_cfg.get('min_oversample_factor', 1.0),
+                    current_epoch=0,
                 )
-                logger.info(f"Using BalancedChangeSampler with change_threshold={sampler_cfg.get('change_threshold', 0.01)}")
+                logger.info(f"Using BalancedChangeSampler with:")
+                logger.info(f"  change_threshold={sampler_cfg.get('change_threshold', 0.01)}")
+                logger.info(f"  batch_balance_ratio={sampler_cfg.get('batch_balance_ratio', 0.5)}")
+                logger.info(f"  use_batch_balance={sampler_cfg.get('use_batch_balance', True)}")
+                logger.info(f"  epoch_schedule_oversample={sampler_cfg.get('epoch_schedule_oversample', True)}")
                 # Create dataloader with custom sampler (note: shuffle must be False when using sampler)
                 train_loader = torch.utils.data.DataLoader(
                     train_set,
@@ -350,6 +360,11 @@ def main():
             conf_tau=cfg.get('conf_tau', 0.9),
             conf_method=cfg.get('conf_method', 'max_prob'),
             pseudo_conf_tau=cfg.get('pseudo_conf_tau', 0.9),
+            seg_mask_mode=cfg.get('seg_mask_mode', 'changed_only'),
+            min_changed_threshold=cfg.get('min_changed_threshold', 10),
+            enable_changed_only_supervision=cfg.get('enable_changed_only_supervision', True),
+            enable_unch_conf_gating=cfg.get('enable_unch_conf_gating', True),
+            enable_pseudo_labeling=cfg.get('enable_pseudo_labeling', True),
         ).to(device)
         loss_fun_change = loss_fun
         
@@ -426,12 +441,24 @@ def main():
             metric_seg.clear()
             epoch_loss = 0.0
             
+            # Update sampler epoch for epoch-aware oversampling scheduling
+            if use_balanced_sampler and hasattr(train_sampler, 'set_epoch'):
+                train_sampler.set_epoch(epoch)
+                effective_oversample = train_sampler.get_effective_oversample_factor()
+                if epoch == 0 or epoch % 5 == 0:  # Log every 5 epochs
+                    logger.info(f"[Epoch {epoch}] Sampler oversample factor: {effective_oversample:.2f}")
+            
             # KL warmup scheduling: ramp lambda_unch from 0 to base value over warmup epochs
             if loss_type == 'extended_triplet':
-                kl_ramp = min(1.0, epoch / max(1, kl_warmup_epochs))
-                loss_fun.lam_unch = base_lambda_unch * kl_ramp
-                if epoch < kl_warmup_epochs:
-                    logger.info(f"[Epoch {epoch}] KL warmup ramp: {kl_ramp:.3f}, lambda_unch: {loss_fun.lam_unch:.4f}")
+                enable_kl_warmup = opt['model'].get('extended_triplet', {}).get('enable_kl_warmup', True)
+                if enable_kl_warmup:
+                    kl_ramp = min(1.0, epoch / max(1, kl_warmup_epochs))
+                    loss_fun.lam_unch = base_lambda_unch * kl_ramp
+                    if epoch < kl_warmup_epochs:
+                        logger.info(f"[Epoch {epoch}] KL warmup ramp: {kl_ramp:.3f}, lambda_unch: {loss_fun.lam_unch:.4f}")
+                else:
+                    # No warmup: use base value directly
+                    loss_fun.lam_unch = base_lambda_unch
 
             _max_train = args.max_train_batches or 0
             _train_total = min(len(train_loader), _max_train) if _max_train > 0 else len(train_loader)

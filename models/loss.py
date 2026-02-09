@@ -541,11 +541,20 @@ class TripletChangeSegLoss(nn.Module):
                  use_conf_gate: bool = False,
                  conf_tau: float = 0.9,
                  conf_method: str = "max_prob",
-                 pseudo_conf_tau: float = 0.9):
+                 pseudo_conf_tau: float = 0.9,
+                 seg_mask_mode: str = "changed_only",
+                 min_changed_threshold: int = 10,
+                 enable_changed_only_supervision: bool = True,
+                 enable_unch_conf_gating: bool = True,
+                 enable_pseudo_labeling: bool = True):
         super().__init__()
         self.seg_loss_fn = seg_loss_fn
         self.cd_loss = ChangeHeadBCEDiceLoss(lambda_dice=1.0)
-        self.unch_kl = UnchangedSymmetricKLLoss(T=T, use_conf_gate=use_conf_gate, tau=conf_tau, conf_method=conf_method)
+        
+        # Apply ablation switch for unchanged confidence gating
+        use_conf_gate_effective = use_conf_gate and enable_unch_conf_gating
+        self.unch_kl = UnchangedSymmetricKLLoss(T=T, use_conf_gate=use_conf_gate_effective, tau=conf_tau, conf_method=conf_method)
+        
         self.ch_div = ChangedDiversityCosineMarginLoss(margin=margin)
         self.couple = CouplingChangeSemanticLoss(distance="l1")
 
@@ -558,7 +567,15 @@ class TripletChangeSegLoss(nn.Module):
         self.boost = float(boost)
         self.ignore_index = int(ignore_index)
         self.pseudo_conf_tau = float(pseudo_conf_tau)
+        self.seg_mask_mode = seg_mask_mode
+        self.min_changed_threshold = min_changed_threshold
         self.eps = 1e-8
+        
+        # Ablation switches
+        self.enable_changed_only_supervision = enable_changed_only_supervision
+        self.enable_unch_conf_gating = enable_unch_conf_gating
+        self.enable_pseudo_labeling = enable_pseudo_labeling
+        
         # Transition weights [C, C] for rebalancing changed pixels
         self.register_buffer('transition_weights', transition_weights if transition_weights is not None else None)
 
@@ -594,23 +611,32 @@ class TripletChangeSegLoss(nn.Module):
         
         # Count changed pixels for fallback logic
         changed_count = (changed * valid1).sum() + (changed * valid2).sum()
-        min_changed_threshold = 10  # Fallback if fewer than 10 changed pixels
         
-        # Apply segmentation supervision only on changed pixels (or fallback to all valid pixels)
-        if changed_count >= min_changed_threshold:
-            # Normal mode: supervise only changed pixels
-            w1 = changed * valid1
-            w2 = changed * valid2
-            
-            # Apply transition-aware weights for changed pixels (optimized)
-            if self.transition_weights is not None:
-                y1_clamped = y1.long().clamp(0, self.transition_weights.size(0)-1)
-                y2_clamped = y2.long().clamp(0, self.transition_weights.size(1)-1)
-                trans_w = self.transition_weights[y1_clamped, y2_clamped]  # [B,H,W]
-                w1 = w1 * trans_w
-                w2 = w2 * trans_w
+        # Apply segmentation supervision based on seg_mask_mode and ablation switches
+        if self.enable_changed_only_supervision and self.seg_mask_mode == "changed_only":
+            # Changed-only mode: supervise only changed pixels (or fallback to all valid pixels)
+            if changed_count >= self.min_changed_threshold:
+                # Normal mode: supervise only changed pixels
+                w1 = changed * valid1
+                w2 = changed * valid2
+                
+                # Apply transition-aware weights for changed pixels (optimized)
+                if self.transition_weights is not None:
+                    y1_clamped = y1.long().clamp(0, self.transition_weights.size(0)-1)
+                    y2_clamped = y2.long().clamp(0, self.transition_weights.size(1)-1)
+                    trans_w = self.transition_weights[y1_clamped, y2_clamped]  # [B,H,W]
+                    w1 = w1 * trans_w
+                    w2 = w2 * trans_w
+            else:
+                # Fallback mode: supervise all valid pixels (no change or very few changed pixels)
+                w1 = valid1
+                w2 = valid2
+        elif self.seg_mask_mode == "mixed":
+            # Mixed mode: supervise changed pixels strongly, unchanged pixels weakly
+            w1 = changed * valid1 + 0.1 * unchanged * valid1
+            w2 = changed * valid2 + 0.1 * unchanged * valid2
         else:
-            # Fallback mode: supervise all valid pixels (no change or very few changed pixels)
+            # Full mode (baseline): supervise all valid pixels equally
             w1 = valid1
             w2 = valid2
 
@@ -624,7 +650,7 @@ class TripletChangeSegLoss(nn.Module):
 
         # Pseudo-labeling on unchanged pixels
         L_pseudo = torch.zeros([], device=z1.device, dtype=z1.dtype)
-        if self.lam_pseudo > 0:
+        if self.lam_pseudo > 0 and self.enable_pseudo_labeling:
             # Build unchanged mask
             unchanged = (c.squeeze(1) <= 0.5).float()  # [B,H,W]
             

@@ -39,12 +39,19 @@ def create_CD_model(opt):
             in_channels=opt['model']['in_channels'],
             init_filters=opt['model']['init_filters'],
             num_classes=opt['model']['n_classes'],
-            use_change_head=opt['model'].get('use_change_head', True),  # Default to True if not specified
+            use_change_head=opt['model'].get('use_change_head', True),
             conv_mode=opt['model']['conv_mode'],
             norm=opt['model']['norm'],
             blocks_down=opt['model']['blocks_down'],
             blocks_up=opt['model']['blocks_up'],
             up_conv_mode=opt['model']['up_conv_mode'],
+            use_change_gating=opt['model'].get('use_change_gating', True),
+            change_gate_alpha=opt['model'].get('change_gate_alpha', 1.0),
+            change_gate_beta=opt['model'].get('change_gate_beta', 0.2),
+            change_gate_mode=opt['model'].get('change_gate_mode', 'additive'),
+            use_interaction_block=opt['model'].get('use_interaction_block', True),
+            interaction_num_heads=opt['model'].get('interaction_num_heads', 4),
+            interaction_use_mamba=opt['model'].get('interaction_use_mamba', False),
         )
     elif model_name in ['cdmamba_change', 'CDMamba_change']:
         from models.CDMamba_change import CDMamba_change as cdmamba_change

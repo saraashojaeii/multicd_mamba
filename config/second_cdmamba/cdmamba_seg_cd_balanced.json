@@ -4,7 +4,7 @@
   "gpu_ids": [0],
   
   "wandb": {
-    "project": "BuildingCD_mamba_based"
+    "project": "scd-balanced-mamba"
   },
 
   "path_cd": {
@@ -59,13 +59,35 @@
       "boost": 5.0,
       "T": 4.0,
       "margin": 0.3,
+      
+      "_comment_seg_masking": "Segmentation supervision strategy",
+      "seg_mask_mode": "changed_only",
+      "min_changed_threshold": 10,
+      
+      "_comment_unch_kl": "Unchanged KL loss with confidence gating",
       "use_conf_gate": true,
       "conf_tau": 0.9,
       "conf_method": "max_prob",
+      "kl_warmup_epochs": 5,
+      
+      "_comment_pseudo": "Pseudo-labeling on unchanged pixels",
+      "use_pseudo_labeling": true,
       "pseudo_conf_tau": 0.9,
-      "kl_warmup_epochs": 5
+      
+      "_comment_ablation": "Ablation switches - set to false to disable features",
+      "enable_changed_only_supervision": true,
+      "enable_unch_conf_gating": true,
+      "enable_kl_warmup": true,
+      "enable_pseudo_labeling": true
     },
     "use_change_head": true,
+    "use_change_gating": true,
+    "change_gate_alpha": 1.0,
+    "change_gate_beta": 0.2,
+    "change_gate_mode": "additive",
+    "use_interaction_block": true,
+    "interaction_num_heads": 4,
+    "interaction_use_mamba": false,
     "init_filters": 16,
     "n_classes": 6,
     "conv_mode": "deepwise",
@@ -101,7 +123,12 @@
       "rare_classes": [3, 5],
       "oversample_factor": 2.0,
       "precompute_stats": false,
-      "stats_file": "config/second_cdmamba/sampler_stats/train_train_sampler_stats.json"
+      "stats_file": "config/second_cdmamba/sampler_stats/train_train_sampler_stats.json",
+      "batch_balance_ratio": 0.5,
+      "use_batch_balance": true,
+      "epoch_schedule_oversample": true,
+      "oversample_warmup_epochs": 10,
+      "min_oversample_factor": 1.0
     }
   }
 }
