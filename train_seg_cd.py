@@ -340,13 +340,23 @@ def main():
             lambda_unch=cfg.get('lambda_unch', 0.2),
             lambda_ch=cfg.get('lambda_ch', 0.2),
             lambda_cpl=cfg.get('lambda_cpl', 0.5),
+            lambda_pseudo=cfg.get('lambda_pseudo', 0.1),
             T=cfg.get('T', 4.0),
             margin=cfg.get('margin', 0.3),
             boost=cfg.get('boost', 5.0),
             ignore_index=ignore_index,
-            transition_weights=transition_weights,  # Pass transition weights for rebalancing
+            transition_weights=transition_weights,
+            use_conf_gate=cfg.get('use_conf_gate', False),
+            conf_tau=cfg.get('conf_tau', 0.9),
+            conf_method=cfg.get('conf_method', 'max_prob'),
+            pseudo_conf_tau=cfg.get('pseudo_conf_tau', 0.9),
         ).to(device)
         loss_fun_change = loss_fun
+        
+        # KL warmup scheduling
+        base_lambda_unch = cfg.get('lambda_unch', 0.2)
+        kl_warmup_epochs = cfg.get('kl_warmup_epochs', 5)
+        logger.info(f"KL warmup: ramping lambda_unch from 0 to {base_lambda_unch} over {kl_warmup_epochs} epochs")
     elif loss_type == 'seg_loss':
         loss_fun = ComboSegLoss(
             class_weights_ce=ce_weights,
@@ -415,6 +425,13 @@ def main():
             cd_model.train()
             metric_seg.clear()
             epoch_loss = 0.0
+            
+            # KL warmup scheduling: ramp lambda_unch from 0 to base value over warmup epochs
+            if loss_type == 'extended_triplet':
+                kl_ramp = min(1.0, epoch / max(1, kl_warmup_epochs))
+                loss_fun.lam_unch = base_lambda_unch * kl_ramp
+                if epoch < kl_warmup_epochs:
+                    logger.info(f"[Epoch {epoch}] KL warmup ramp: {kl_ramp:.3f}, lambda_unch: {loss_fun.lam_unch:.4f}")
 
             _max_train = args.max_train_batches or 0
             _train_total = min(len(train_loader), _max_train) if _max_train > 0 else len(train_loader)

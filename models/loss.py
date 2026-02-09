@@ -399,12 +399,18 @@ class ChangeHeadBCEDiceLoss(nn.Module):
 class UnchangedSymmetricKLLoss(nn.Module):
     """Symmetric KL between t1/t2 class distributions on UNCHANGED pixels (c==0).
     Inputs are logits for numerical stability; temperature T softens distributions.
+    With optional confidence gating to avoid reinforcing wrong predictions.
     """
-    def __init__(self, T: float = 4.0, detach_one_side: bool = True, eps: float = 1e-8):
+    def __init__(self, T: float = 4.0, detach_one_side: bool = True, eps: float = 1e-8,
+                 use_conf_gate: bool = False, tau: float = 0.9, conf_method: str = "max_prob"):
         super().__init__()
         self.T = float(T)
         self.detach_one_side = bool(detach_one_side)
         self.eps = eps
+        self.use_conf_gate = bool(use_conf_gate)
+        self.tau = float(tau)
+        assert conf_method in {"max_prob", "cosine"}, f"conf_method must be 'max_prob' or 'cosine', got {conf_method}"
+        self.conf_method = conf_method
 
     def forward(self, z1: torch.Tensor, z2: torch.Tensor, change_mask: torch.Tensor):
         # z1,z2: [B,C,H,W] logits; change_mask: [B,1,H,W] or [B,H,W] where 0=unchanged,1=changed
@@ -426,6 +432,23 @@ class UnchangedSymmetricKLLoss(nn.Module):
         if self.detach_one_side:
             p1 = p1.detach()
             p2 = p2.detach()
+
+        # Apply confidence gating if enabled
+        if self.use_conf_gate:
+            if self.conf_method == "max_prob":
+                # Max-prob confidence: only apply KL where both predictions are confident
+                conf1 = p1.max(dim=1, keepdim=True)[0]  # [B,1,H,W]
+                conf2 = p2.max(dim=1, keepdim=True)[0]  # [B,1,H,W]
+                conf_mask = ((conf1 > self.tau) & (conf2 > self.tau)).float()
+            else:  # cosine
+                # Cosine similarity of distributions: high similarity = confident agreement
+                num = (p1 * p2).sum(dim=1, keepdim=True)  # [B,1,H,W]
+                den = (p1.norm(p=2, dim=1, keepdim=True) * p2.norm(p=2, dim=1, keepdim=True)) + self.eps
+                cos_sim = num / den  # [B,1,H,W]
+                conf_mask = (cos_sim > self.tau).float()
+            
+            # Apply confidence mask to unchanged pixels
+            unch = unch * conf_mask
 
         kl12 = (p1 * (logp1 - logp2)).sum(dim=1, keepdim=True)  # [B,1,H,W]
         kl21 = (p2 * (logp2 - logp1)).sum(dim=1, keepdim=True)
@@ -509,15 +532,20 @@ class TripletChangeSegLoss(nn.Module):
                  lambda_unch: float = 0.2,
                  lambda_ch: float = 0.2,
                  lambda_cpl: float = 0.5,
+                 lambda_pseudo: float = 0.1,
                  T: float = 4.0,
                  margin: float = 0.3,
                  boost: float = 5.0,
                  ignore_index: int = 255,
-                 transition_weights: torch.Tensor = None):
+                 transition_weights: torch.Tensor = None,
+                 use_conf_gate: bool = False,
+                 conf_tau: float = 0.9,
+                 conf_method: str = "max_prob",
+                 pseudo_conf_tau: float = 0.9):
         super().__init__()
         self.seg_loss_fn = seg_loss_fn
         self.cd_loss = ChangeHeadBCEDiceLoss(lambda_dice=1.0)
-        self.unch_kl = UnchangedSymmetricKLLoss(T=T)
+        self.unch_kl = UnchangedSymmetricKLLoss(T=T, use_conf_gate=use_conf_gate, tau=conf_tau, conf_method=conf_method)
         self.ch_div = ChangedDiversityCosineMarginLoss(margin=margin)
         self.couple = CouplingChangeSemanticLoss(distance="l1")
 
@@ -526,8 +554,10 @@ class TripletChangeSegLoss(nn.Module):
         self.lam_unch = lambda_unch
         self.lam_ch = lambda_ch
         self.lam_cpl = lambda_cpl
+        self.lam_pseudo = lambda_pseudo
         self.boost = float(boost)
         self.ignore_index = int(ignore_index)
+        self.pseudo_conf_tau = float(pseudo_conf_tau)
         self.eps = 1e-8
         # Transition weights [C, C] for rebalancing changed pixels
         self.register_buffer('transition_weights', transition_weights if transition_weights is not None else None)
@@ -554,25 +584,35 @@ class TripletChangeSegLoss(nn.Module):
             z2r = _resize_like(z2, y2)
             loss_map_t2 = F.cross_entropy(z2r, y2.long(), ignore_index=self.ignore_index, reduction='none')  # [B,H,W]
 
-        # Build change-aware weights: w = 1 + boost * change_mask
-        w = 1.0 + self.boost * c.float().squeeze(1)  # [B,H,W]
+        # Build masks for changed vs unchanged pixels
+        changed = (c.squeeze(1) > 0.5).float()  # [B,H,W]
+        unchanged = 1.0 - changed  # [B,H,W]
         
-        # Apply transition-aware weights for changed pixels (optimized)
-        if self.transition_weights is not None:
-            # Use gather for faster indexing (no boolean mask)
-            y1_clamped = y1.long().clamp(0, self.transition_weights.size(0)-1)
-            y2_clamped = y2.long().clamp(0, self.transition_weights.size(1)-1)
-            # Index transition weights: trans_w[i,j,k] = W[y1[i,j,k], y2[i,j,k]]
-            trans_w = self.transition_weights[y1_clamped, y2_clamped]  # [B,H,W]
-            # Only apply to changed pixels (where c > 0.5)
-            changed_mask = (c.squeeze(1) > 0.5).float()  # [B,H,W]
-            trans_w = 1.0 + (trans_w - 1.0) * changed_mask  # Blend: unchanged=1.0, changed=trans_w
-            w = w * trans_w
-        
+        # Valid pixel masks (exclude ignore_index)
         valid1 = (y1 != self.ignore_index).float()
         valid2 = (y2 != self.ignore_index).float()
-        w1 = w * valid1
-        w2 = w * valid2
+        
+        # Count changed pixels for fallback logic
+        changed_count = (changed * valid1).sum() + (changed * valid2).sum()
+        min_changed_threshold = 10  # Fallback if fewer than 10 changed pixels
+        
+        # Apply segmentation supervision only on changed pixels (or fallback to all valid pixels)
+        if changed_count >= min_changed_threshold:
+            # Normal mode: supervise only changed pixels
+            w1 = changed * valid1
+            w2 = changed * valid2
+            
+            # Apply transition-aware weights for changed pixels (optimized)
+            if self.transition_weights is not None:
+                y1_clamped = y1.long().clamp(0, self.transition_weights.size(0)-1)
+                y2_clamped = y2.long().clamp(0, self.transition_weights.size(1)-1)
+                trans_w = self.transition_weights[y1_clamped, y2_clamped]  # [B,H,W]
+                w1 = w1 * trans_w
+                w2 = w2 * trans_w
+        else:
+            # Fallback mode: supervise all valid pixels (no change or very few changed pixels)
+            w1 = valid1
+            w2 = valid2
 
         L_t1 = (loss_map_t1 * w1).sum() / (w1.sum() + self.eps)
         L_t2 = (loss_map_t2 * w2).sum() / (w2.sum() + self.eps)
@@ -582,18 +622,67 @@ class TripletChangeSegLoss(nn.Module):
         L_ch   = self.ch_div(z1, z2, c)
         L_cpl  = self.couple(z1, z2, u)
 
+        # Pseudo-labeling on unchanged pixels
+        L_pseudo = torch.zeros([], device=z1.device, dtype=z1.dtype)
+        if self.lam_pseudo > 0:
+            # Build unchanged mask
+            unchanged = (c.squeeze(1) <= 0.5).float()  # [B,H,W]
+            
+            # Compute softmax probabilities
+            z1_resized = _resize_like(z1, y1)
+            z2_resized = _resize_like(z2, y2)
+            p1 = F.softmax(z1_resized, dim=1)  # [B,C,H,W]
+            p2 = F.softmax(z2_resized, dim=1)  # [B,C,H,W]
+            
+            # Compute confidence for each pixel
+            conf1 = p1.max(dim=1)[0]  # [B,H,W]
+            conf2 = p2.max(dim=1)[0]  # [B,H,W]
+            
+            # Pick teacher: use t1 if more confident, else t2
+            use_t1_as_teacher = (conf1 > conf2).float()  # [B,H,W]
+            use_t2_as_teacher = 1.0 - use_t1_as_teacher
+            
+            # Generate pseudo-labels from more confident prediction
+            pseudo_t1 = torch.argmax(p1, dim=1)  # [B,H,W]
+            pseudo_t2 = torch.argmax(p2, dim=1)  # [B,H,W]
+            pseudo_label = (use_t1_as_teacher * pseudo_t1 + use_t2_as_teacher * pseudo_t2).long()
+            
+            # Confidence mask: only supervise where teacher is confident
+            teacher_conf = torch.max(conf1, conf2)  # [B,H,W]
+            conf_mask = (teacher_conf > self.pseudo_conf_tau).float()
+            
+            # Valid mask: exclude ignore_index pixels
+            valid_mask = valid1 * valid2  # Both must be valid
+            
+            # Final mask: unchanged & confident & valid
+            pseudo_mask = unchanged * conf_mask * valid_mask  # [B,H,W]
+            
+            if pseudo_mask.sum() > 0:
+                # Apply CE loss on student logits (the less confident one)
+                # Student t1: supervised by pseudo label from t2 (when t2 is teacher)
+                loss_pseudo_t1 = F.cross_entropy(z1_resized, pseudo_label, ignore_index=self.ignore_index, reduction='none')
+                loss_pseudo_t1 = (loss_pseudo_t1 * pseudo_mask * use_t2_as_teacher).sum() / ((pseudo_mask * use_t2_as_teacher).sum() + self.eps)
+                
+                # Student t2: supervised by pseudo label from t1 (when t1 is teacher)
+                loss_pseudo_t2 = F.cross_entropy(z2_resized, pseudo_label, ignore_index=self.ignore_index, reduction='none')
+                loss_pseudo_t2 = (loss_pseudo_t2 * pseudo_mask * use_t1_as_teacher).sum() / ((pseudo_mask * use_t1_as_teacher).sum() + self.eps)
+                
+                L_pseudo = loss_pseudo_t1 + loss_pseudo_t2
+
         # Guard numerics
         L_seg  = torch.nan_to_num(L_seg,  nan=0.0, posinf=1e4, neginf=0.0)
         L_cd   = torch.nan_to_num(L_cd,   nan=0.0, posinf=1e4, neginf=0.0)
         L_unch = torch.nan_to_num(L_unch, nan=0.0, posinf=1e4, neginf=0.0)
         L_ch   = torch.nan_to_num(L_ch,   nan=0.0, posinf=1e4, neginf=0.0)
         L_cpl  = torch.nan_to_num(L_cpl,  nan=0.0, posinf=1e4, neginf=0.0)
+        L_pseudo = torch.nan_to_num(L_pseudo, nan=0.0, posinf=1e4, neginf=0.0)
 
         total = (self.lam_seg * L_seg +
                  self.lam_cd  * L_cd  +
                  self.lam_unch* L_unch+
                  self.lam_ch  * L_ch  +
-                 self.lam_cpl * L_cpl)
+                 self.lam_cpl * L_cpl +
+                 self.lam_pseudo * L_pseudo)
 
         return total, {
             "seg": L_seg.item(),
@@ -602,7 +691,8 @@ class TripletChangeSegLoss(nn.Module):
             "cd": L_cd.item(),
             "unch_kl": L_unch.item(),
             "ch_div": L_ch.item(),
-            "couple": L_cpl.item()
+            "couple": L_cpl.item(),
+            "pseudo_unch": L_pseudo.item()
         }
 
 
