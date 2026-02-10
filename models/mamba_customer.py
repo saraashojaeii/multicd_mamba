@@ -16,7 +16,15 @@ except ImportError:
     causal_conv1d_fn, causal_conv1d_update = None
 
 try:
-    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn, bimamba_inner_fn, mamba_inner_fn_no_out_proj
+    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn
+    try:
+        from mamba_ssm.ops.selective_scan_interface import mamba_inner_fn_no_out_proj
+    except ImportError:
+        mamba_inner_fn_no_out_proj = None
+    try:
+        from mamba_ssm.ops.selective_scan_interface import bimamba_inner_fn
+    except ImportError:
+        bimamba_inner_fn = None
 except ImportError:
     selective_scan_fn, mamba_inner_fn, bimamba_inner_fn, mamba_inner_fn_no_out_proj = None, None, None, None
 
@@ -73,7 +81,8 @@ class ConvMamba(nn.Module):
         self.expand = expand
         self.d_inner = int(self.expand * self.d_model)
         self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
-        self.use_fast_path = use_fast_path
+        # Disable fast path if mamba functions are not available
+        self.use_fast_path = use_fast_path and (mamba_inner_fn is not None)
         self.layer_idx = layer_idx
         self.bimamba_type = bimamba_type
 
@@ -438,7 +447,8 @@ class L_GF_Mamba(nn.Module):
         self.expand = expand
         self.d_inner = int(self.expand * self.d_model)
         self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
-        self.use_fast_path = use_fast_path
+        # Disable fast path if mamba functions are not available
+        self.use_fast_path = use_fast_path and (mamba_inner_fn is not None)
         self.layer_idx = layer_idx
         self.bimamba_type = bimamba_type
 
@@ -813,7 +823,8 @@ class G_GL_Mamba(nn.Module):
         self.expand = expand
         self.d_inner = int(self.expand * self.d_model)
         self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
-        self.use_fast_path = use_fast_path
+        # Disable fast path if mamba functions are not available
+        self.use_fast_path = use_fast_path and (mamba_inner_fn is not None)
         self.layer_idx = layer_idx
         self.bimamba_type = bimamba_type
 
