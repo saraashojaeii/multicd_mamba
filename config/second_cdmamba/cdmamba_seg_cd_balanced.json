@@ -52,10 +52,10 @@
       "seg_loss": "weighted_ce_dice",
       "lambda_seg": 1.5,
       "lambda_cd": 1.0,
-      "lambda_unch": 0.1,
+      "lambda_unch": 0.7,
       "lambda_ch": 0.2,
-      "lambda_cpl": 0.1,
-      "lambda_pseudo": 0.1,
+      "lambda_cpl": 0.3,
+      "lambda_pseudo": 0.5,
       "boost": 5.0,
       "T": 4.0,
       "margin": 0.3,
@@ -68,7 +68,7 @@
       "use_conf_gate": true,
       "conf_tau": 0.9,
       "conf_method": "max_prob",
-      "kl_warmup_epochs": 5,
+      "kl_warmup_epochs": 20,
       
       "_comment_pseudo": "Pseudo-labeling on unchanged pixels",
       "use_pseudo_labeling": true,
@@ -123,7 +123,7 @@
       "rare_classes": [3, 5],
       "oversample_factor": 2.0,
       "precompute_stats": false,
-      "stats_file": "config/second_cdmamba/sampler_stats/train_train_sampler_stats.json",
+      "stats_file": "config/landsat_cdmamba/sampler_stats/train_train_sampler_stats.json",
       "batch_balance_ratio": 0.5,
       "use_batch_balance": true,
       "epoch_schedule_oversample": true,
@@ -132,3 +132,4 @@
     }
   }
 }
+
