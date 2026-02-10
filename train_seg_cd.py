@@ -283,6 +283,21 @@ def main():
     total_params = sum(p.numel() for p in cd_model.parameters())
     trainable_params = sum(p.numel() for p in cd_model.parameters() if p.requires_grad)
     logger.info(f'Total params: {total_params:,} | Trainable: {trainable_params:,} ({100*trainable_params/total_params:.2f}%)')
+    
+    # ========== SANITY CHECK: Model Architecture Summary ==========
+    logger.info("=" * 80)
+    logger.info("Model Architecture Configuration:")
+    logger.info("-" * 80)
+    if hasattr(cd_model, 'use_change_gating'):
+        logger.info(f"  Change-Guided Gating:   {'ENABLED' if cd_model.use_change_gating else 'DISABLED'} "
+                   f"(α={opt['model'].get('change_gate_alpha', 1.0):.2f}, β={opt['model'].get('change_gate_beta', 0.2):.2f}, "
+                   f"mode={opt['model'].get('change_gate_mode', 'additive')})")
+    if hasattr(cd_model, 'use_interaction_block'):
+        logger.info(f"  Interaction Block:      {'ENABLED' if cd_model.use_interaction_block else 'DISABLED'} "
+                   f"(heads={opt['model'].get('interaction_num_heads', 4)}, "
+                   f"mamba={opt['model'].get('interaction_use_mamba', False)})")
+    logger.info(f"  Change Head:            {'ENABLED' if opt['model'].get('use_change_head', True) else 'DISABLED'}")
+    logger.info("=" * 80)
 
     # GFLOPs (CUDA + torchinfo)
     if device.type == 'cuda' and summary is not None:
@@ -371,7 +386,21 @@ def main():
         # KL warmup scheduling
         base_lambda_unch = cfg.get('lambda_unch', 0.2)
         kl_warmup_epochs = cfg.get('kl_warmup_epochs', 5)
-        logger.info(f"KL warmup: ramping lambda_unch from 0 to {base_lambda_unch} over {kl_warmup_epochs} epochs")
+        
+        # ========== SANITY CHECK: Loss Configuration Summary ==========
+        logger.info("=" * 80)
+        logger.info("TripletChangeSegLoss Configuration Summary:")
+        logger.info("-" * 80)
+        logger.info(f"  Seg Masking Mode:       {loss_fun.seg_mask_mode} (min_changed={loss_fun.min_changed_threshold})")
+        logger.info(f"  Pseudo-labeling:        {'ENABLED' if loss_fun.enable_pseudo_labeling else 'DISABLED'} "
+                   f"(λ={cfg.get('lambda_pseudo', 0.1):.3f}, tau={loss_fun.pseudo_conf_tau:.2f})")
+        logger.info(f"  Unch Conf Gating:       {'ENABLED' if loss_fun.enable_unch_conf_gating else 'DISABLED'} "
+                   f"(tau={cfg.get('conf_tau', 0.9):.2f}, method={cfg.get('conf_method', 'max_prob')})")
+        logger.info(f"  KL Warmup:              {kl_warmup_epochs} epochs (0 → {base_lambda_unch:.3f})")
+        logger.info(f"  Changed-only Superv:    {'ENABLED' if loss_fun.enable_changed_only_supervision else 'DISABLED'}")
+        logger.info(f"  Loss Weights:           λ_seg={cfg.get('lambda_seg', 1.0):.2f}, λ_cd={cfg.get('lambda_cd', 1.0):.2f}, "
+                   f"λ_unch={cfg.get('lambda_unch', 0.2):.2f}, λ_ch={cfg.get('lambda_ch', 0.2):.2f}")
+        logger.info("=" * 80)
     elif loss_type == 'seg_loss':
         loss_fun = ComboSegLoss(
             class_weights_ce=ce_weights,
