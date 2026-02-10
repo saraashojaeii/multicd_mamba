@@ -35,11 +35,46 @@ ${DATASET_ROOT}/
 
 ## Training
 
+### Precompute Sampler Statistics (Optional but Recommended)
+
+If using balanced sampling (`use_balanced_sampler: true`), precompute change ratios and rare class statistics:
+
+```bash
+python data/balanced_sampler.py \
+  --dataset_name SECOND \
+  --dataset_root /path/to/SECOND/train \
+  --phase train \
+  --output_file config/second_cdmamba/sampler_stats/train_sampler_stats.json \
+  --change_threshold 0.01 \
+  --rare_classes 3 5
+```
+
+**For Landsat dataset:**
+```bash
+python data/balanced_sampler.py \
+  --dataset_name Landsat \
+  --dataset_root /path/to/Landsat/train \
+  --phase train \
+  --output_file config/landsat_cdmamba/sampler_stats/train_sampler_stats.json \
+  --change_threshold 0.01 \
+  --rare_classes 3 5
+```
+
+**Arguments:**
+- `--dataset_name`: Dataset name (SECOND, Landsat, etc.)
+- `--dataset_root`: Path to dataset split (train/val/test)
+- `--phase`: Dataset phase (train, val, test)
+- `--output_file`: Where to save precomputed stats JSON
+- `--change_threshold`: Minimum change ratio to consider (default: 0.01)
+- `--rare_classes`: Space-separated list of rare class IDs to track
+
+This precomputation speeds up training startup and ensures consistent sampling across runs.
+
 ### Multi-class Change Detection
 
 ```bash
 python train_seg_cd.py \
-  --config config/second_cdmamba/cdmamba_seg_cd_multiclass.json \
+  --config config/second_cdmamba/cdmamba_seg_cd_balanced.json \
   --phase train \
   --dataset SECOND \
   --tag exp1 \
