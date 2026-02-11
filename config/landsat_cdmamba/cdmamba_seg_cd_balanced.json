@@ -18,7 +18,7 @@
     "train": {
       "name": "Landsat",
       "datasetroot": "/root/home/pvc/01_change_detection/00_multiclass_datasets/Landsat/train",
-      "resolution": 256,
+      "resolution": 416,
       "phase": "train",
       "batch_size": 8,
       "num_workers": 4,
@@ -28,7 +28,7 @@
     "val": {
       "name": "Landsat",
       "datasetroot": "/root/home/pvc/01_change_detection/00_multiclass_datasets/Landsat/val",
-      "resolution": 256,
+      "resolution": 416,
       "phase": "val",
       "batch_size": 8,
       "num_workers": 4,
@@ -37,7 +37,7 @@
     "test": {
       "name": "Landsat",
       "datasetroot": "/root/home/pvc/01_change_detection/00_multiclass_datasets/Landsat/test",
-      "resolution": 256,
+      "resolution": 416,
       "phase": "test",
       "batch_size": 1,
       "num_workers": 1,
@@ -89,7 +89,7 @@
     "interaction_num_heads": 4,
     "interaction_use_mamba": false,
     "init_filters": 16,
-    "n_classes": 6,
+    "n_classes": 5,
     "conv_mode": "deepwise",
     "up_conv_mode": "deepwise",
     "spatial_dims": 2,
@@ -120,7 +120,7 @@
     "use_balanced_sampler": true,
     "balanced_sampler": {
       "change_threshold": 0.01,
-      "rare_classes": [3, 5],
+      "rare_classes": [],
       "oversample_factor": 2.0,
       "precompute_stats": false,
       "stats_file": "config/landsat_cdmamba/sampler_stats/train_train_sampler_stats.json",
