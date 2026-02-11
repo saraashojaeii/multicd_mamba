@@ -11,7 +11,7 @@
     "log": "/root/home/pvc/01_change_detection/Building_changedetection_job/experiments/logs",
     "result": "/root/home/pvc/01_change_detection/Building_changedetection_job/experiments/results",
     "checkpoint": "/root/home/pvc/01_change_detection/Building_changedetection_job/experiments/checkpoint",
-    "resume_state": null
+    "resume_state": null  
   },
   
   "datasets": {

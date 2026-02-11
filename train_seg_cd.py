@@ -158,6 +158,7 @@ def main():
     parser.add_argument('--change_threshold', type=float, default=0.2)
     parser.add_argument('--resume_epoch', type=int, default=None, help='Resume training from this epoch index (loads matching checkpoints).')
     parser.add_argument('--resume_model_path', type=str, default=None, help='Existing stamped experiment folder to reuse (log/result/checkpoint).')
+    parser.add_argument('--resume_checkpoint', type=str, default=None, help='Exact path to checkpoint file (.pth) to resume from.')
     parser.add_argument('--exp_folder', type=str, default=None, help='Experiment folder name (if not provided, auto-generated from dataset/tag/seed).')
     args = parser.parse_args()
 
@@ -442,7 +443,43 @@ def main():
 
         # Resume support
         start_epoch = 0
-        if args.resume_epoch is not None:
+        if args.resume_checkpoint is not None:
+            # Direct checkpoint file path provided
+            gen_path = args.resume_checkpoint
+            if os.path.exists(gen_path):
+                state = torch.load(gen_path, map_location=device)
+                cd_model.load_state_dict(state, strict=True)
+                logging.getLogger('base').info(f"[resume] Loaded model weights from {gen_path}")
+                
+                # Try to load optimizer from same directory (replace _gen.pth or _net.pth with _opt.pth)
+                opt_path = gen_path.replace('_gen.pth', '_opt.pth').replace('_net.pth', '_optimizer.pth')
+                if not opt_path.endswith('_optimizer.pth') and not opt_path.endswith('_opt.pth'):
+                    # If filename doesn't match pattern, try adding _optimizer before .pth
+                    opt_path = gen_path.replace('.pth', '_optimizer.pth')
+                
+                if os.path.exists(opt_path):
+                    opt_state = torch.load(opt_path, map_location=device)
+                    if isinstance(opt_state, dict) and 'optimizer' in opt_state:
+                        optimizer.load_state_dict(opt_state['optimizer'])
+                        logging.getLogger('base').info(f"[resume] Loaded optimizer state from {opt_path}")
+                    else:
+                        logging.getLogger('base').warning(f"[resume] Optimizer state not found in {opt_path}")
+                else:
+                    logging.getLogger('base').warning(f"[resume] Optimizer checkpoint not found: {opt_path}")
+                
+                # Try to extract epoch number from filename
+                import re
+                match = re.search(r'(\d+)_(?:net|gen)\.pth', os.path.basename(gen_path))
+                if match:
+                    start_epoch = int(match.group(1))
+                    logging.getLogger('base').info(f"[resume] Resuming from epoch {start_epoch}")
+                else:
+                    logging.getLogger('base').warning(f"[resume] Could not extract epoch from filename, starting from epoch 0")
+            else:
+                logging.getLogger('base').error(f"[resume] Checkpoint file not found: {gen_path}")
+                raise FileNotFoundError(f"Checkpoint not found: {gen_path}")
+        elif args.resume_epoch is not None:
+            # Legacy: epoch-based resume
             ckpt_dir = opt['path_cd']['checkpoint']
             gen_path = os.path.join(ckpt_dir, f'cd_model_E{args.resume_epoch}_gen.pth')
             opt_path = os.path.join(ckpt_dir, f'cd_model_E{args.resume_epoch}_opt.pth')
@@ -460,6 +497,9 @@ def main():
             else:
                 logging.getLogger('base').warning(f"[resume] Optimizer checkpoint not found: {opt_path}")
             start_epoch = int(args.resume_epoch)
+        
+        # Update scheduler if resuming
+        if start_epoch > 0:
             try:
                 scheduler.last_epoch = start_epoch - 1
             except Exception:
