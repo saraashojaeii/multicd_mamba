@@ -7,6 +7,8 @@
     "project": "scd-balanced-mamba"
   },
 
+  "colormap": [[255, 255, 255], [0, 155, 0], [255, 165, 0], [230, 30, 100], [0, 170, 240]],
+
   "path_cd": {
     "log": "/root/home/pvc/01_change_detection/Building_changedetection_job/experiments/logs",
     "result": "/root/home/pvc/01_change_detection/Building_changedetection_job/experiments/results",

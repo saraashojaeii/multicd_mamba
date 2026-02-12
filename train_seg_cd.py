@@ -99,7 +99,7 @@ def safe_to_numpy_uint8(x: torch.Tensor) -> np.ndarray:
     return np.squeeze(arr)
 
 
-def log_first_batch_to_wandb(prefix, batch, seg_t1, seg_t2, seg_logits_t1, seg_logits_t2, change_pred, num_classes):
+def log_first_batch_to_wandb(prefix, batch, seg_t1, seg_t2, seg_logits_t1, seg_logits_t2, change_pred, num_classes, colormap=None):
     def _norm(img):
         img = img.detach().cpu()
         if img.min() < 0: img = (img + 1.0) / 2.0
@@ -114,10 +114,10 @@ def log_first_batch_to_wandb(prefix, batch, seg_t1, seg_t2, seg_logits_t1, seg_l
     d = {
         f"{prefix}/input_T1": [wandb.Image(_norm(A0))],
         f"{prefix}/input_T2": [wandb.Image(_norm(B0))],
-        f"{prefix}/gt_seg_t1": [wandb.Image(create_color_mask(seg_t1[0], num_classes=num_classes))],
-        f"{prefix}/gt_seg_t2": [wandb.Image(create_color_mask(seg_t2[0], num_classes=num_classes))],
-        f"{prefix}/pred_seg_t1": [wandb.Image(create_color_mask(pred1, num_classes=num_classes))],
-        f"{prefix}/pred_seg_t2": [wandb.Image(create_color_mask(pred2, num_classes=num_classes))],
+        f"{prefix}/gt_seg_t1": [wandb.Image(create_color_mask(seg_t1[0], num_classes=num_classes, colormap=colormap))],
+        f"{prefix}/gt_seg_t2": [wandb.Image(create_color_mask(seg_t2[0], num_classes=num_classes, colormap=colormap))],
+        f"{prefix}/pred_seg_t1": [wandb.Image(create_color_mask(pred1, num_classes=num_classes, colormap=colormap))],
+        f"{prefix}/pred_seg_t2": [wandb.Image(create_color_mask(pred2, num_classes=num_classes, colormap=colormap))],
     }
 
     # probability maps
@@ -250,6 +250,7 @@ def main():
     # Class weights
     num_classes = int(opt['model']['n_classes'])
     ignore_index = int(opt.get('train', {}).get('ignore_index', 255))
+    colormap = opt.get('colormap', None)  # Extract colormap from config for visualization
     if train_loader is not None:
         counts = estimate_class_counts(train_loader, num_classes=num_classes, ignore_index=ignore_index, max_batches=200)
         ce_weights = compute_class_weights(counts, method="median_frequency").to(device)
@@ -610,7 +611,7 @@ def main():
 
                 # first-batch visuals
                 if step == 0:
-                    log_first_batch_to_wandb("train", batch, seg_t1, seg_t2, seg_logits_t1, seg_logits_t2, change_pred, num_classes)
+                    log_first_batch_to_wandb("train", batch, seg_t1, seg_t2, seg_logits_t1, seg_logits_t2, change_pred, num_classes, colormap)
 
             # epoch-end: seg metrics
             seg_scores = metric_seg.get_scores()
@@ -750,7 +751,7 @@ def main():
 
                         # first val batch visuals
                         if vstep == 0:
-                            log_first_batch_to_wandb("val", vbatch, y1, y2, v_seg1, v_seg2, v_change, num_classes)
+                            log_first_batch_to_wandb("val", vbatch, y1, y2, v_seg1, v_seg2, v_change, num_classes, colormap)
 
                 val_scores = val_metric.get_scores()
                 val_mf1 = val_scores['mf1']
@@ -904,7 +905,7 @@ def main():
 
                 # first-batch visuals
                 if tstep == 0:
-                    log_first_batch_to_wandb("test", tb, y1, y2, s1, s2, chg, num_classes)
+                    log_first_batch_to_wandb("test", tb, y1, y2, s1, s2, chg, num_classes, colormap)
 
         test_scores = test_metric.get_scores()
         if (t_tp + t_fp + t_fn) > 0:

@@ -185,11 +185,16 @@ def normalize_change_target(seg1: torch.Tensor | None,
     change = (s1 != s2).long()
     return change
 
-def create_color_mask(tensor, num_classes: int = 10):
+def create_color_mask(tensor, num_classes: int = 10, colormap=None):
     """Convert a 2-D label tensor/ndarray to an RGB image with a categorical colormap.
 
     This is used for logging multi-class segmentation masks to wandb so that they
     appear in color instead of a binary/grayscale mask.
+    
+    Args:
+        tensor: 2D label tensor/array or 3D RGB image
+        num_classes: Number of classes in the dataset
+        colormap: Optional list of RGB colors [[R,G,B], ...]. If None, uses default SECOND colormap.
     """
     import numpy as _np
     import matplotlib as _mpl
@@ -215,19 +220,22 @@ def create_color_mask(tensor, num_classes: int = 10):
     h, w = arr.shape
     unique_vals = _np.unique(arr)
     
-    # Fix matplotlib deprecation warning and ensure class 0 is visible
-    cmap = [[255, 255, 255], [0, 0, 255], [128, 128, 128], [0, 128, 0], [0, 255, 0], [128, 0, 0], [255, 0, 0]]
+    # Use provided colormap or default to SECOND colormap
+    if colormap is None:
+        cmap = [[255, 255, 255], [0, 0, 255], [128, 128, 128], [0, 128, 0], [0, 255, 0], [128, 0, 0], [255, 0, 0]]
+    else:
+        cmap = colormap
 
     rgb = _np.zeros((h, w, 3), dtype=_np.uint8)
     
     # Custom color mapping to ensure class 0 is visible (not black)
     colors = []
-    for i in range(num_classes):
+    for i in range(min(num_classes, len(cmap))):
         color = _np.array(cmap[i])
         colors.append(color.astype(_np.uint8))
     
     # Apply color mapping
-    for cls in range(num_classes):
+    for cls in range(min(num_classes, len(colors))):
         if cls in unique_vals:
             rgb[arr == cls] = colors[cls]
     
