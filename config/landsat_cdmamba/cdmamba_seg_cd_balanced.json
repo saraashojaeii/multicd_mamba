@@ -124,7 +124,7 @@
       "change_threshold": 0.01,
       "rare_classes": [],
       "oversample_factor": 2.0,
-      "precompute_stats": false,
+      "precompute_stats": true,
       "stats_file": "config/landsat_cdmamba/sampler_stats/train_train_sampler_stats.json",
       "batch_balance_ratio": 0.5,
       "use_batch_balance": true,
