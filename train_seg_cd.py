@@ -454,8 +454,25 @@ def main():
             gen_path = args.resume_checkpoint
             if os.path.exists(gen_path):
                 state = torch.load(gen_path, map_location=device)
-                cd_model.load_state_dict(state, strict=True)
-                logging.getLogger('base').info(f"[resume] Loaded model weights from {gen_path}")
+                
+                # Check for class mismatch in segmentation heads
+                model_state = cd_model.state_dict()
+                incompatible_keys = []
+                for key in list(state.keys()):
+                    if key in model_state:
+                        if state[key].shape != model_state[key].shape:
+                            incompatible_keys.append(key)
+                            logger.info(f"[resume] Skipping {key}: shape mismatch (checkpoint: {state[key].shape}, model: {model_state[key].shape})")
+                            del state[key]
+                
+                # Load with strict=False to allow partial loading
+                missing_keys, unexpected_keys = cd_model.load_state_dict(state, strict=False)
+                
+                if incompatible_keys:
+                    logger.info(f"[resume] Loaded model weights from {gen_path} (skipped {len(incompatible_keys)} incompatible keys due to class mismatch)")
+                    logger.info(f"[resume] Incompatible keys (will be randomly initialized): {incompatible_keys}")
+                else:
+                    logger.info(f"[resume] Loaded model weights from {gen_path}")
                 
                 # Try to load optimizer from same directory (replace _gen.pth or _net.pth with _opt.pth)
                 opt_path = gen_path.replace('_gen.pth', '_opt.pth').replace('_net.pth', '_optimizer.pth')
@@ -491,8 +508,25 @@ def main():
             opt_path = os.path.join(ckpt_dir, f'cd_model_E{args.resume_epoch}_opt.pth')
             if os.path.exists(gen_path):
                 state = torch.load(gen_path, map_location=device)
-                cd_model.load_state_dict(state, strict=True)
-                logging.getLogger('base').info(f"[resume] Loaded model weights from {gen_path}")
+                
+                # Check for class mismatch in segmentation heads
+                model_state = cd_model.state_dict()
+                incompatible_keys = []
+                for key in list(state.keys()):
+                    if key in model_state:
+                        if state[key].shape != model_state[key].shape:
+                            incompatible_keys.append(key)
+                            logger.info(f"[resume] Skipping {key}: shape mismatch (checkpoint: {state[key].shape}, model: {model_state[key].shape})")
+                            del state[key]
+                
+                # Load with strict=False to allow partial loading
+                missing_keys, unexpected_keys = cd_model.load_state_dict(state, strict=False)
+                
+                if incompatible_keys:
+                    logger.info(f"[resume] Loaded model weights from {gen_path} (skipped {len(incompatible_keys)} incompatible keys due to class mismatch)")
+                    logger.info(f"[resume] Incompatible keys (will be randomly initialized): {incompatible_keys}")
+                else:
+                    logger.info(f"[resume] Loaded model weights from {gen_path}")
             else:
                 logging.getLogger('base').warning(f"[resume] Model checkpoint not found: {gen_path}")
             if os.path.exists(opt_path):
