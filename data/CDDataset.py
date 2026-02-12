@@ -105,13 +105,14 @@ class CDDataset(Dataset):
 
 
 class SCDDataset(Dataset):
-    def __init__(self, root_dir, resolution=512, split='train', data_len=-1, label_transform=None):
+    def __init__(self, root_dir, resolution=512, split='train', data_len=-1, label_transform=None, colormap=None):
 
         self.root_dir = root_dir
         self.resolution = resolution
         self.data_len = data_len
         self.split = split #train / val / test
         self.label_transform = label_transform
+        self.colormap = colormap  # Dataset-specific colormap for RGB->class conversion
 
         self.list_path = os.path.join(self.root_dir, LIST_FOLDER_NAME, self.split + '.txt')
 
@@ -156,8 +157,10 @@ class SCDDataset(Dataset):
         # --- map RGB -> class ids ---
         from data.util import rgb_mask_to_class
         from data.colormap import second_colormap
-        lab1 = rgb_mask_to_class(rgb_L1, second_colormap)   # [H,W] int
-        lab2 = rgb_mask_to_class(rgb_L2, second_colormap)   # [H,W] int
+        # Use dataset-specific colormap if provided, otherwise default to second_colormap
+        cmap = self.colormap if self.colormap is not None else second_colormap
+        lab1 = rgb_mask_to_class(rgb_L1, cmap)   # [H,W] int
+        lab2 = rgb_mask_to_class(rgb_L2, cmap)   # [H,W] int
     
         # --- resize everything to the same size (nearest for labels) ---
         # use self.resolution or image size; here we enforce square (H=W=resolution)

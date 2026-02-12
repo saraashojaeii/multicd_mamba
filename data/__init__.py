@@ -44,7 +44,8 @@ def create_scd_dataset(dataset_opt, phase):
     dataset = SCDDataset(root_dir=dataset_opt["datasetroot"],
                         resolution=dataset_opt["resolution"],
                         split=phase,
-                        data_len=dataset_opt["data_len"]
+                        data_len=dataset_opt["data_len"],
+                        colormap=dataset_opt.get("colormap", None)
                         )
     logger = logging.getLogger('base')
     logger.info('Dataset [{:s} - {:s} - {:s}] is created'.format(dataset.__class__.__name__,

@@ -197,6 +197,11 @@ def main():
 
     # Dataloaders
     train_loader = val_loader = test_loader = None
+    # Add colormap to dataset options if present in global config
+    if 'colormap' in opt:
+        for phase in opt['datasets']:
+            opt['datasets'][phase]['colormap'] = opt['colormap']
+    
     for phase, dataset_opt in opt['datasets'].items():
         if phase == 'train' and args.phase != 'test':
             train_set = Data.create_scd_dataset(dataset_opt=dataset_opt, phase='train')

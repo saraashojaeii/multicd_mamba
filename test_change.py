@@ -149,6 +149,10 @@ def main():
     g = torch.Generator()
     g.manual_seed(args.seed if args.seed is not None else 42)
 
+    # Add colormap to dataset options if present in global config
+    if 'colormap' in opt:
+        opt['datasets']['test']['colormap'] = opt['colormap']
+    
     test_dataset = Data.create_scd_dataset(opt['datasets']['test'], 'test')
     logger.info(f'Test dataset length: {len(test_dataset)}')
     
