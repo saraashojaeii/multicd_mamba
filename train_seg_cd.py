@@ -422,6 +422,36 @@ def main():
         loss_fun = MultiClassCDLoss(num_classes=num_classes, seg_loss="cedice", change_loss="ce", loss_weights=lw)
         loss_fun_change = loss_fun
         if isinstance(loss_fun, nn.Module): loss_fun.to(device)
+    elif loss_type == 'combined_consistency':
+        # New combined loss with semantic-change consistency
+        from models.loss import CombinedLoss
+        lw = opt['model'].get('loss_weights', {
+            'seg_ce': 1.0, 'seg_dice': 1.0, 
+            'change_ce': 1.0, 'change_dice': 1.0,
+            'consistency': 0.5
+        })
+        consistency_cfg = opt['model'].get('consistency_config', {})
+        loss_fun = CombinedLoss(
+            num_classes=num_classes,
+            seg_ce_weight=lw.get('seg_ce', 1.0),
+            seg_dice_weight=lw.get('seg_dice', 1.0),
+            change_ce_weight=lw.get('change_ce', 1.0),
+            change_dice_weight=lw.get('change_dice', 1.0),
+            consistency_weight=lw.get('consistency', 0.5),
+            ignore_index=ignore_index,
+            use_soft_consistency=consistency_cfg.get('use_soft_labels', True),
+        ).to(device)
+        loss_fun_change = loss_fun
+        logger.info("=" * 80)
+        logger.info("CombinedLoss with Consistency Configuration:")
+        logger.info("-" * 80)
+        logger.info(f"  Seg CE Weight:          {lw.get('seg_ce', 1.0):.2f}")
+        logger.info(f"  Seg Dice Weight:        {lw.get('seg_dice', 1.0):.2f}")
+        logger.info(f"  Change CE Weight:       {lw.get('change_ce', 1.0):.2f}")
+        logger.info(f"  Change Dice Weight:     {lw.get('change_dice', 1.0):.2f}")
+        logger.info(f"  Consistency Weight:     {lw.get('consistency', 0.5):.2f}")
+        logger.info(f"  Use Soft Consistency:   {consistency_cfg.get('use_soft_labels', True)}")
+        logger.info("=" * 80)
     else:
         raise ValueError(f"Unsupported loss: {loss_type}")
 
@@ -589,7 +619,14 @@ def main():
                     seg_logits_t1, seg_logits_t2, change_pred, _ = unpack_outputs(outputs)
 
                     # ----- loss -----
-                    if loss_type == 'multi_class_cd':
+                    loss_components = {}
+                    if loss_type == 'combined_consistency':
+                        change_bin = derive_change_bin(seg_t1, seg_t2)
+                        loss, loss_components = loss_fun(
+                            seg_logits_t1, seg_logits_t2, change_pred,
+                            seg_t1, seg_t2, change_bin
+                        )
+                    elif loss_type == 'multi_class_cd':
                         preds = (seg_logits_t1, seg_logits_t2, change_pred)
                         change_bin = derive_change_bin(seg_t1, seg_t2)
                         targets = {'seg_t1': seg_t1, 'seg_t2': seg_t2, 'change': change_bin}
@@ -720,6 +757,20 @@ def main():
                 'train/class_playground_f1': per_class_metrics['f1_per_class'][5] if len(per_class_metrics['f1_per_class']) > 5 else 0.0,
                 'epoch': epoch
             }
+            
+            # Add consistency loss components if using combined_consistency loss
+            if loss_type == 'combined_consistency' and loss_components:
+                train_metrics.update({
+                    'train/seg_loss': loss_components.get('seg_loss', 0.0),
+                    'train/change_loss': loss_components.get('change_loss', 0.0),
+                    'train/consistency_loss': loss_components.get('consistency_loss', 0.0),
+                    'train/seg_ce_t1': loss_components.get('seg_ce_t1', 0.0),
+                    'train/seg_ce_t2': loss_components.get('seg_ce_t2', 0.0),
+                    'train/seg_dice_t1': loss_components.get('seg_dice_t1', 0.0),
+                    'train/seg_dice_t2': loss_components.get('seg_dice_t2', 0.0),
+                    'train/change_ce': loss_components.get('change_ce', 0.0),
+                    'train/change_dice': loss_components.get('change_dice', 0.0),
+                })
             
             # Add transition metrics
             for trans_key, trans_val in transition_metrics.items():

@@ -1089,3 +1089,226 @@ class ComboSegLoss(nn.Module):
             losses = [self._loss_single(l, target) for l in logits]
             return torch.stack(losses).mean()
         return self._loss_single(logits, target)
+
+
+class SemanticChangeConsistencyLoss(nn.Module):
+    """
+    Consistency loss between semantic changes and binary change predictions.
+    
+    This loss ensures that:
+    1. If semantic segmentation changes between T1 and T2, binary change should be predicted
+    2. If semantic segmentation is the same, no change should be predicted
+    
+    Args:
+        ignore_index: Index to ignore in semantic masks (e.g., background or unlabeled)
+        loss_weight: Weight for this loss component
+        use_soft_labels: If True, use soft semantic probabilities; if False, use hard labels
+        temperature: Temperature for softening semantic predictions
+    """
+    
+    def __init__(
+        self, 
+        ignore_index: int = 255,
+        loss_weight: float = 1.0,
+        use_soft_labels: bool = True,
+        temperature: float = 1.0,
+    ):
+        super().__init__()
+        self.ignore_index = ignore_index
+        self.loss_weight = loss_weight
+        self.use_soft_labels = use_soft_labels
+        self.temperature = temperature
+        
+    def forward(
+        self, 
+        seg_logits_t1: torch.Tensor,
+        seg_logits_t2: torch.Tensor,
+        change_logits: torch.Tensor,
+        seg_gt_t1: torch.Tensor = None,
+        seg_gt_t2: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            seg_logits_t1: [B, C, H, W] - semantic logits for T1
+            seg_logits_t2: [B, C, H, W] - semantic logits for T2
+            change_logits: [B, 2, H, W] - binary change logits [no-change, change]
+            seg_gt_t1: [B, H, W] - optional ground truth for T1 (for masking)
+            seg_gt_t2: [B, H, W] - optional ground truth for T2 (for masking)
+            
+        Returns:
+            consistency_loss: scalar tensor
+        """
+        B, C, H, W = seg_logits_t1.shape
+        
+        # Resize if needed
+        if seg_logits_t1.shape[2:] != change_logits.shape[2:]:
+            seg_logits_t1 = F.interpolate(seg_logits_t1, size=change_logits.shape[2:], mode='bilinear', align_corners=False)
+            seg_logits_t2 = F.interpolate(seg_logits_t2, size=change_logits.shape[2:], mode='bilinear', align_corners=False)
+        
+        # Get semantic predictions
+        if self.use_soft_labels:
+            # Use soft probabilities
+            seg_prob_t1 = F.softmax(seg_logits_t1 / self.temperature, dim=1)  # [B, C, H, W]
+            seg_prob_t2 = F.softmax(seg_logits_t2 / self.temperature, dim=1)
+            
+            # Compute semantic change as L1 distance between probability distributions
+            # Sum over classes, average over spatial dimensions
+            semantic_change_map = torch.sum(torch.abs(seg_prob_t2 - seg_prob_t1), dim=1, keepdim=True)  # [B, 1, H, W]
+            # Normalize to [0, 1] range (max L1 distance between two probability distributions is 2)
+            semantic_change_map = semantic_change_map / 2.0
+        else:
+            # Use hard labels
+            seg_pred_t1 = torch.argmax(seg_logits_t1, dim=1)  # [B, H, W]
+            seg_pred_t2 = torch.argmax(seg_logits_t2, dim=1)
+            
+            # Binary semantic change map: 1 if classes differ, 0 otherwise
+            semantic_change_map = (seg_pred_t1 != seg_pred_t2).float().unsqueeze(1)  # [B, 1, H, W]
+        
+        # Get binary change predictions
+        change_prob = F.softmax(change_logits, dim=1)[:, 1:2]  # [B, 1, H, W] - probability of change
+        
+        # Create mask for valid pixels
+        valid_mask = torch.ones_like(semantic_change_map)
+        
+        if seg_gt_t1 is not None and seg_gt_t2 is not None:
+            # Resize ground truth if needed
+            if seg_gt_t1.shape[1:] != semantic_change_map.shape[2:]:
+                seg_gt_t1_resized = F.interpolate(
+                    seg_gt_t1.unsqueeze(1).float(), 
+                    size=semantic_change_map.shape[2:], 
+                    mode='nearest'
+                ).squeeze(1).long()
+                seg_gt_t2_resized = F.interpolate(
+                    seg_gt_t2.unsqueeze(1).float(), 
+                    size=semantic_change_map.shape[2:], 
+                    mode='nearest'
+                ).squeeze(1).long()
+            else:
+                seg_gt_t1_resized = seg_gt_t1
+                seg_gt_t2_resized = seg_gt_t2
+            
+            # Mask out ignored pixels
+            valid_mask = ((seg_gt_t1_resized != self.ignore_index) & 
+                         (seg_gt_t2_resized != self.ignore_index)).float().unsqueeze(1)
+        
+        # Consistency loss: MSE between semantic change map and binary change prediction
+        # Both are in [0, 1] range
+        consistency_loss = F.mse_loss(
+            change_prob * valid_mask, 
+            semantic_change_map * valid_mask,
+            reduction='sum'
+        ) / (valid_mask.sum() + 1e-6)
+        
+        return self.loss_weight * consistency_loss
+
+
+class CombinedLoss(nn.Module):
+    """
+    Combined loss for joint semantic segmentation and change detection.
+    
+    Includes:
+    - Semantic segmentation loss (CE + Dice) for T1 and T2
+    - Binary change detection loss (CE + Dice)
+    - Semantic-change consistency loss
+    """
+    
+    def __init__(
+        self,
+        num_classes: int,
+        seg_ce_weight: float = 1.0,
+        seg_dice_weight: float = 1.0,
+        change_ce_weight: float = 1.0,
+        change_dice_weight: float = 1.0,
+        consistency_weight: float = 0.5,
+        ignore_index: int = 255,
+        use_soft_consistency: bool = True,
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+        self.seg_ce_weight = seg_ce_weight
+        self.seg_dice_weight = seg_dice_weight
+        self.change_ce_weight = change_ce_weight
+        self.change_dice_weight = change_dice_weight
+        
+        # Loss functions
+        self.ce_loss = nn.CrossEntropyLoss(ignore_index=ignore_index)
+        self.dice_loss = DiceLoss(num_classes=num_classes, ignore_index=ignore_index)
+        self.consistency_loss = SemanticChangeConsistencyLoss(
+            ignore_index=ignore_index,
+            loss_weight=consistency_weight,
+            use_soft_labels=use_soft_consistency,
+        )
+        
+    def forward(
+        self,
+        seg_logits_t1: torch.Tensor,
+        seg_logits_t2: torch.Tensor,
+        change_logits: torch.Tensor,
+        seg_gt_t1: torch.Tensor,
+        seg_gt_t2: torch.Tensor,
+        change_gt: torch.Tensor,
+    ):
+        """
+        Args:
+            seg_logits_t1: [B, C, H, W]
+            seg_logits_t2: [B, C, H, W]
+            change_logits: [B, 2, H, W]
+            seg_gt_t1: [B, H, W]
+            seg_gt_t2: [B, H, W]
+            change_gt: [B, H, W] - binary change labels
+            
+        Returns:
+            total_loss, loss_dict
+        """
+        losses = {}
+        
+        # Resize predictions to match ground truth if needed
+        if seg_logits_t1.shape[2:] != seg_gt_t1.shape[1:]:
+            seg_logits_t1 = F.interpolate(seg_logits_t1, size=seg_gt_t1.shape[1:], mode='bilinear', align_corners=False)
+            seg_logits_t2 = F.interpolate(seg_logits_t2, size=seg_gt_t2.shape[1:], mode='bilinear', align_corners=False)
+        
+        if change_logits.shape[2:] != change_gt.shape[1:]:
+            change_logits = F.interpolate(change_logits, size=change_gt.shape[1:], mode='bilinear', align_corners=False)
+        
+        # Semantic segmentation losses
+        seg_ce_t1 = self.ce_loss(seg_logits_t1, seg_gt_t1.long())
+        seg_ce_t2 = self.ce_loss(seg_logits_t2, seg_gt_t2.long())
+        seg_dice_t1 = self.dice_loss(seg_logits_t1, seg_gt_t1.long())
+        seg_dice_t2 = self.dice_loss(seg_logits_t2, seg_gt_t2.long())
+        
+        losses['seg_ce_t1'] = seg_ce_t1
+        losses['seg_ce_t2'] = seg_ce_t2
+        losses['seg_dice_t1'] = seg_dice_t1
+        losses['seg_dice_t2'] = seg_dice_t2
+        
+        seg_loss = (
+            self.seg_ce_weight * (seg_ce_t1 + seg_ce_t2) / 2.0 +
+            self.seg_dice_weight * (seg_dice_t1 + seg_dice_t2) / 2.0
+        )
+        losses['seg_loss'] = seg_loss
+        
+        # Binary change detection losses
+        change_ce = self.ce_loss(change_logits, change_gt.long())
+        change_dice = self.dice_loss(change_logits, change_gt.long())
+        
+        losses['change_ce'] = change_ce
+        losses['change_dice'] = change_dice
+        
+        change_loss = (
+            self.change_ce_weight * change_ce +
+            self.change_dice_weight * change_dice
+        )
+        losses['change_loss'] = change_loss
+        
+        # Consistency loss
+        consistency = self.consistency_loss(
+            seg_logits_t1, seg_logits_t2, change_logits,
+            seg_gt_t1, seg_gt_t2
+        )
+        losses['consistency_loss'] = consistency
+        
+        # Total loss
+        total_loss = seg_loss + change_loss + consistency
+        losses['total_loss'] = total_loss
+        
+        return total_loss, losses

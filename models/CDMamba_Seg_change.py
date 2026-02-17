@@ -71,6 +71,125 @@ class CrossTemporalFusion(nn.Module):
         x = torch.cat([f1, f2, adiff, diff], dim=1)
         return self.fuse(x)
 
+class JointFeatureLearning(nn.Module):
+    """
+    Bidirectional feature learning: change features influence semantic features during encoding.
+    This replaces post-hoc fusion with joint learning.
+    """
+    def __init__(self, channels: int):
+        super().__init__()
+        # Change-to-semantic influence
+        self.change_to_sem = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.Sigmoid()  # Gate mechanism
+        )
+        # Semantic-to-change influence
+        self.sem_to_change = nn.Sequential(
+            nn.Conv2d(channels * 2, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True)
+        )
+        # Refine change features
+        self.refine_change = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True)
+        )
+        
+    def forward(self, f1: torch.Tensor, f2: torch.Tensor, change_feat: torch.Tensor):
+        """
+        Args:
+            f1, f2: Semantic features from T1, T2 [B, C, H, W]
+            change_feat: Initial change features [B, C, H, W]
+        Returns:
+            f1_enhanced, f2_enhanced, change_enhanced
+        """
+        # Change features modulate semantic features (multiplicative gating)
+        change_gate = self.change_to_sem(change_feat)
+        f1_enhanced = f1 * (1.0 + change_gate)
+        f2_enhanced = f2 * (1.0 + change_gate)
+        
+        # Semantic features enhance change features (additive)
+        sem_avg = (f1_enhanced + f2_enhanced) / 2.0
+        change_context = self.sem_to_change(torch.cat([sem_avg, change_feat], dim=1))
+        change_enhanced = self.refine_change(change_feat + change_context)
+        
+        return f1_enhanced, f2_enhanced, change_enhanced
+
+class MultiScaleInteractionBlock(nn.Module):
+    """
+    Lightweight multi-scale semantic-change interaction.
+    More efficient than the bottleneck version - uses depthwise separable convs.
+    """
+    def __init__(self, channels: int):
+        super().__init__()
+        self.channels = channels
+        
+        # Efficient cross-attention using depthwise separable convs
+        self.sem_query = nn.Conv2d(channels, channels, 1)
+        self.chg_key = nn.Conv2d(channels, channels, 1)
+        self.chg_value = nn.Conv2d(channels, channels, 1)
+        
+        self.chg_query = nn.Conv2d(channels, channels, 1)
+        self.sem_key = nn.Conv2d(channels, channels, 1)
+        self.sem_value = nn.Conv2d(channels, channels, 1)
+        
+        self.norm_sem = nn.BatchNorm2d(channels)
+        self.norm_chg = nn.BatchNorm2d(channels)
+        
+        # Lightweight refinement
+        self.refine_sem = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.Conv2d(channels, channels, 1, bias=False),
+            nn.ReLU(inplace=True)
+        )
+        self.refine_chg = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.Conv2d(channels, channels, 1, bias=False),
+            nn.ReLU(inplace=True)
+        )
+        
+    def forward(self, sem_t1: torch.Tensor, sem_t2: torch.Tensor, change_feat: torch.Tensor):
+        """
+        Args:
+            sem_t1, sem_t2: [B, C, H, W]
+            change_feat: [B, C, H, W]
+        Returns:
+            Enhanced (sem_t1, sem_t2, change_feat)
+        """
+        B, C, H, W = sem_t1.shape
+        sem_avg = (sem_t1 + sem_t2) / 2.0
+        
+        # Semantic attends to change (spatial attention)
+        sem_q = self.sem_query(sem_avg).view(B, C, -1)  # [B, C, HW]
+        chg_k = self.chg_key(change_feat).view(B, C, -1)  # [B, C, HW]
+        chg_v = self.chg_value(change_feat).view(B, C, -1)  # [B, C, HW]
+        
+        attn_sem = torch.softmax(torch.bmm(sem_q.transpose(1, 2), chg_k) / (C ** 0.5), dim=-1)  # [B, HW, HW]
+        sem_attended = torch.bmm(chg_v, attn_sem.transpose(1, 2)).view(B, C, H, W)
+        
+        # Change attends to semantic
+        chg_q = self.chg_query(change_feat).view(B, C, -1)
+        sem_k = self.sem_key(sem_avg).view(B, C, -1)
+        sem_v = self.sem_value(sem_avg).view(B, C, -1)
+        
+        attn_chg = torch.softmax(torch.bmm(chg_q.transpose(1, 2), sem_k) / (C ** 0.5), dim=-1)
+        chg_attended = torch.bmm(sem_v, attn_chg.transpose(1, 2)).view(B, C, H, W)
+        
+        # Residual + refinement
+        sem_out = self.refine_sem(self.norm_sem(sem_avg + sem_attended))
+        chg_out = self.refine_chg(self.norm_chg(change_feat + chg_attended))
+        
+        # Apply to both T1 and T2
+        sem_t1_out = sem_t1 + sem_out
+        sem_t2_out = sem_t2 + sem_out
+        change_out = change_feat + chg_out
+        
+        return sem_t1_out, sem_t2_out, change_out
+
 class SemanticChangeInteractionBlock(nn.Module):
     """
     Lightweight semantic-change interaction at bottleneck.
@@ -366,13 +485,38 @@ class CDMamba_seg_cd(nn.Module):
         # Fusion at bottleneck level
         self.fuse_bottleneck = CrossTemporalFusion(bottleneck_channels)
         
-        # Semantic-Change Interaction Block at bottleneck
+        # Joint feature learning modules at each scale (bidirectional influence)
+        self.joint_learning_scales = nn.ModuleList([
+            JointFeatureLearning(init_filters * (2 ** i)) for i in range(len(blocks_down))
+        ])
+        self.joint_learning_bottleneck = JointFeatureLearning(bottleneck_channels)
+        
+        # Multi-scale interaction blocks at each encoder level
         if self.use_interaction_block:
-            self.interaction_block = SemanticChangeInteractionBlock(
+            self.interaction_blocks = nn.ModuleList([
+                MultiScaleInteractionBlock(init_filters * (2 ** i)) for i in range(len(blocks_down))
+            ])
+            # Bottleneck interaction (more powerful)
+            self.interaction_block_bottleneck = SemanticChangeInteractionBlock(
                 channels=bottleneck_channels,
                 num_heads=interaction_num_heads,
                 use_mamba=interaction_use_mamba
             )
+        
+        # Skip connection alignment modules
+        # These create aligned skip connections for all three paths from fused features
+        self.skip_align_t1 = nn.ModuleList([
+            nn.Conv2d(init_filters * (2 ** i), init_filters * (2 ** i), 1, bias=False)
+            for i in range(len(blocks_down))
+        ])
+        self.skip_align_t2 = nn.ModuleList([
+            nn.Conv2d(init_filters * (2 ** i), init_filters * (2 ** i), 1, bias=False)
+            for i in range(len(blocks_down))
+        ])
+        self.skip_align_change = nn.ModuleList([
+            nn.Conv2d(init_filters * (2 ** i), init_filters * (2 ** i), 1, bias=False)
+            for i in range(len(blocks_down))
+        ])
 
         # --- SEGMENTATION HEADS ---
         # Each head outputs num_classes channels
@@ -528,34 +672,69 @@ class CDMamba_seg_cd(nn.Module):
             x1_latent = self.context(x1_latent)
             x2_latent = self.context(x2_latent)
             
-            # Cross-temporal fusion at each encoder scale (multi-scale differencing)
+            # Multi-scale joint feature learning with interaction
             down_x_fused = []
+            down_x1_enhanced = []
+            down_x2_enhanced = []
+            
             for i in range(len(down_x1)):
                 x1_i, x2_i = down_x1[i], down_x2[i]
+                
+                # Step 1: Initial fusion to create change features
                 fused_i = self.fuse_scales[i](x1_i, x2_i)
-                down_x_fused.append(fused_i)
+                
+                # Step 2: Joint learning - change features influence semantic features
+                x1_i_enh, x2_i_enh, fused_i_enh = self.joint_learning_scales[i](x1_i, x2_i, fused_i)
+                
+                # Step 3: Multi-scale interaction between semantic and change
+                if self.use_interaction_block:
+                    x1_i_enh, x2_i_enh, fused_i_enh = self.interaction_blocks[i](
+                        x1_i_enh, x2_i_enh, fused_i_enh
+                    )
+                
+                down_x1_enhanced.append(x1_i_enh)
+                down_x2_enhanced.append(x2_i_enh)
+                down_x_fused.append(fused_i_enh)
             
-            # Fuse bottleneck features for change path
+            # Bottleneck: fusion + joint learning + interaction
             fused_latent = self.fuse_bottleneck(x1_latent, x2_latent)
+            x1_latent, x2_latent, fused_latent = self.joint_learning_bottleneck(
+                x1_latent, x2_latent, fused_latent
+            )
             
-            # Semantic-Change Interaction at bottleneck
             if self.use_interaction_block:
-                x1_latent, x2_latent, fused_latent = self.interaction_block(
+                x1_latent, x2_latent, fused_latent = self.interaction_block_bottleneck(
                     x1_latent, x2_latent, fused_latent
                 )
             
-            # Decode each path
-            down_x_fused.reverse()
-            down_x1.reverse()
-            down_x2.reverse()
+            # Create aligned skip connections for all three paths
+            # This fixes the skip connection mismatch issue
+            down_x1_aligned = []
+            down_x2_aligned = []
+            down_x_change_aligned = []
             
-            # Decode for T1 and T2 (for segmentation)
-            seg1 = self._decode_with_layers(x1_latent, down_x1, self.up_samples_seg_t1, self.srcm_decoder_layers_seg_t1)
-            seg2 = self._decode_with_layers(x2_latent, down_x2, self.up_samples_seg_t2, self.srcm_decoder_layers_seg_t2)
+            for i in range(len(down_x1_enhanced)):
+                # Use enhanced features as base, then create path-specific alignments
+                x1_skip = self.skip_align_t1[i](down_x1_enhanced[i])
+                x2_skip = self.skip_align_t2[i](down_x2_enhanced[i])
+                chg_skip = self.skip_align_change[i](down_x_fused[i])
+                
+                down_x1_aligned.append(x1_skip)
+                down_x2_aligned.append(x2_skip)
+                down_x_change_aligned.append(chg_skip)
+            
+            # Decode each path with aligned skip connections
+            down_x_change_aligned.reverse()
+            down_x1_aligned.reverse()
+            down_x2_aligned.reverse()
+            
+            # Decode for T1 and T2 (for segmentation) with aligned skip connections
+            seg1 = self._decode_with_layers(x1_latent, down_x1_aligned, self.up_samples_seg_t1, self.srcm_decoder_layers_seg_t1)
+            seg2 = self._decode_with_layers(x2_latent, down_x2_aligned, self.up_samples_seg_t2, self.srcm_decoder_layers_seg_t2)
             
             if self.use_change_head:
-                # Decode dedicated change path
-                chg_dec = self._decode_with_layers(fused_latent, down_x_fused, self.up_samples_change, self.srcm_decoder_layers_change)
+                # Decode dedicated change path with aligned skip connections
+                chg_dec = self._decode_with_layers(fused_latent, down_x_change_aligned, self.up_samples_change, self.srcm_decoder_layers_change)
                 change_logits = self.change_head(chg_dec)
                 
                 # Change-guided gating: force semantic heads to focus on change-relevant regions
