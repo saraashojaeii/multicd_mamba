@@ -119,26 +119,35 @@ class JointFeatureLearning(nn.Module):
 
 class MultiScaleInteractionBlock(nn.Module):
     """
-    Lightweight multi-scale semantic-change interaction.
-    More efficient than the bottleneck version - uses depthwise separable convs.
+    Memory-efficient multi-scale semantic-change interaction.
+    Uses channel attention instead of spatial attention to avoid OOM on high-resolution features.
     """
     def __init__(self, channels: int):
         super().__init__()
         self.channels = channels
         
-        # Efficient cross-attention using depthwise separable convs
-        self.sem_query = nn.Conv2d(channels, channels, 1)
-        self.chg_key = nn.Conv2d(channels, channels, 1)
-        self.chg_value = nn.Conv2d(channels, channels, 1)
+        # Channel attention: semantic ↔ change interaction
+        # Much more memory efficient: [B, C, C] instead of [B, HW, HW]
+        self.sem_to_chg = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),  # [B, C, 1, 1]
+            nn.Conv2d(channels, channels // 4, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // 4, channels, 1),
+            nn.Sigmoid()
+        )
         
-        self.chg_query = nn.Conv2d(channels, channels, 1)
-        self.sem_key = nn.Conv2d(channels, channels, 1)
-        self.sem_value = nn.Conv2d(channels, channels, 1)
+        self.chg_to_sem = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, channels // 4, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // 4, channels, 1),
+            nn.Sigmoid()
+        )
         
         self.norm_sem = nn.BatchNorm2d(channels)
         self.norm_chg = nn.BatchNorm2d(channels)
         
-        # Lightweight refinement
+        # Lightweight spatial refinement with depthwise separable convs
         self.refine_sem = nn.Sequential(
             nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=False),
             nn.BatchNorm2d(channels),
@@ -163,25 +172,17 @@ class MultiScaleInteractionBlock(nn.Module):
         B, C, H, W = sem_t1.shape
         sem_avg = (sem_t1 + sem_t2) / 2.0
         
-        # Semantic attends to change (spatial attention)
-        sem_q = self.sem_query(sem_avg).view(B, C, -1)  # [B, C, HW]
-        chg_k = self.chg_key(change_feat).view(B, C, -1)  # [B, C, HW]
-        chg_v = self.chg_value(change_feat).view(B, C, -1)  # [B, C, HW]
+        # Channel attention: change features modulate semantic channels
+        chg_attention = self.chg_to_sem(change_feat)  # [B, C, 1, 1]
+        sem_modulated = sem_avg * chg_attention  # [B, C, H, W]
         
-        attn_sem = torch.softmax(torch.bmm(sem_q.transpose(1, 2), chg_k) / (C ** 0.5), dim=-1)  # [B, HW, HW]
-        sem_attended = torch.bmm(chg_v, attn_sem.transpose(1, 2)).view(B, C, H, W)
-        
-        # Change attends to semantic
-        chg_q = self.chg_query(change_feat).view(B, C, -1)
-        sem_k = self.sem_key(sem_avg).view(B, C, -1)
-        sem_v = self.sem_value(sem_avg).view(B, C, -1)
-        
-        attn_chg = torch.softmax(torch.bmm(chg_q.transpose(1, 2), sem_k) / (C ** 0.5), dim=-1)
-        chg_attended = torch.bmm(sem_v, attn_chg.transpose(1, 2)).view(B, C, H, W)
+        # Channel attention: semantic features modulate change channels
+        sem_attention = self.sem_to_chg(sem_avg)  # [B, C, 1, 1]
+        chg_modulated = change_feat * sem_attention  # [B, C, H, W]
         
         # Residual + refinement
-        sem_out = self.refine_sem(self.norm_sem(sem_avg + sem_attended))
-        chg_out = self.refine_chg(self.norm_chg(change_feat + chg_attended))
+        sem_out = self.refine_sem(self.norm_sem(sem_avg + sem_modulated))
+        chg_out = self.refine_chg(self.norm_chg(change_feat + chg_modulated))
         
         # Apply to both T1 and T2
         sem_t1_out = sem_t1 + sem_out
