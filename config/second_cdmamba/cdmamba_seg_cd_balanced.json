@@ -10,16 +10,16 @@
   "colormap": [[255, 255, 255], [0, 0, 255], [128, 128, 128], [0, 128, 0], [0, 255, 0], [128, 0, 0], [255, 0, 0]],
 
   "path_cd": {
-    "log": "/root/home/pvc/01_change_detection/Building_changedetection_job/experiments/logs",
-    "result": "/root/home/pvc/01_change_detection/Building_changedetection_job/experiments/results",
-    "checkpoint": "/root/home/pvc/01_change_detection/Building_changedetection_job/experiments/checkpoint",
+    "log": "/root/home/pvc/mcd_dataset/SECOND/experiments/logs",
+    "result": "/root/home/pvc/mcd_dataset/SECOND/experiments/results",
+    "checkpoint": "/root/home/pvc/mcd_dataset/SECOND/checkpoint",
     "resume_state": null
   },
   
   "datasets": {
     "train": {
       "name": "SECOND",
-      "datasetroot": "/root/home/pvc/01_change_detection/00_multiclass_datasets/SECOND/train",
+      "datasetroot": "/root/home/pvc/mcd_dataset/SECOND/train",
       "resolution": 512,
       "phase": "train",
       "batch_size": 4,
@@ -29,7 +29,7 @@
     },
     "val": {
       "name": "SECOND",
-      "datasetroot": "/root/home/pvc/01_change_detection/00_multiclass_datasets/SECOND/val",
+      "datasetroot": "/root/home/pvc/mcd_dataset/SECOND/val",
       "resolution": 512,
       "phase": "val",
       "batch_size": 4,
@@ -38,7 +38,7 @@
     },
     "test": {
       "name": "SECOND",
-      "datasetroot": "/root/home/pvc/01_change_detection/00_multiclass_datasets/SECOND/test",
+      "datasetroot": "/root/home/pvc/mcd_dataset/SECOND/test",
       "resolution": 512,
       "phase": "test",
       "batch_size": 1,
