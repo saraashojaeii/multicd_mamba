@@ -178,6 +178,81 @@ def compute_semantic_metrics_on_changed(pred_t1, pred_t2, gt_t1, gt_t2, num_clas
     }
 
 
+def compute_semantic_metrics_on_predicted_changed(pred_t1, pred_t2, gt_t1, gt_t2, pred_change_mask, num_classes, ignore_index=255):
+    """Compute semantic segmentation metrics on pixels identified as changed by the PREDICTED change mask.
+    
+    This metric evaluates how well the model performs semantic segmentation when relying on its own
+    change detection predictions, rather than ground truth change masks.
+    
+    Args:
+        pred_t1, pred_t2: [B,H,W] predicted class indices
+        gt_t1, gt_t2: [B,H,W] ground truth class indices
+        pred_change_mask: [B,H,W] predicted binary change mask (0=no change, 1=change)
+        num_classes: number of semantic classes
+        ignore_index: index to ignore
+    
+    Returns:
+        dict with 'iou', 'f1', 'accuracy' computed only on predicted changed pixels
+    """
+    # Identify pixels predicted as changed
+    pred_changed_mask = (pred_change_mask == 1)
+    valid_mask = (gt_t1 != ignore_index) & (gt_t2 != ignore_index)
+    mask = pred_changed_mask & valid_mask
+    
+    if not mask.any():
+        return {'iou': 0.0, 'f1': 0.0, 'accuracy': 0.0, 'num_pixels': 0}
+    
+    # Extract predictions and GT on predicted changed pixels
+    pred_t1_chg = pred_t1[mask]
+    pred_t2_chg = pred_t2[mask]
+    gt_t1_chg = gt_t1[mask]
+    gt_t2_chg = gt_t2[mask]
+    
+    # Combine T1 and T2 for overall metrics
+    pred_all = np.concatenate([pred_t1_chg, pred_t2_chg])
+    gt_all = np.concatenate([gt_t1_chg, gt_t2_chg])
+    
+    # Compute confusion matrix
+    cm = np.zeros((num_classes, num_classes), dtype=np.int64)
+    for p, g in zip(pred_all, gt_all):
+        if 0 <= p < num_classes and 0 <= g < num_classes:
+            cm[g, p] += 1
+    
+    # Compute metrics
+    tp_per_class = np.diag(cm)
+    fp_per_class = cm.sum(axis=0) - tp_per_class
+    fn_per_class = cm.sum(axis=1) - tp_per_class
+    
+    # IoU per class
+    iou_per_class = tp_per_class / (tp_per_class + fp_per_class + fn_per_class + 1e-8)
+    
+    # F1 per class
+    precision_per_class = tp_per_class / (tp_per_class + fp_per_class + 1e-8)
+    recall_per_class = tp_per_class / (tp_per_class + fn_per_class + 1e-8)
+    f1_per_class = 2 * precision_per_class * recall_per_class / (precision_per_class + recall_per_class + 1e-8)
+    
+    # Mean metrics (only over classes present in GT)
+    present_classes = (tp_per_class + fn_per_class) > 0
+    if present_classes.any():
+        mean_iou = iou_per_class[present_classes].mean()
+        mean_f1 = f1_per_class[present_classes].mean()
+    else:
+        mean_iou = 0.0
+        mean_f1 = 0.0
+    
+    # Overall accuracy
+    accuracy = (pred_all == gt_all).sum() / len(gt_all)
+    
+    return {
+        'iou': float(mean_iou),
+        'f1': float(mean_f1),
+        'accuracy': float(accuracy),
+        'num_pixels': int(mask.sum()),
+        'iou_per_class': iou_per_class.tolist(),
+        'f1_per_class': f1_per_class.tolist(),
+    }
+
+
 def compute_per_class_metrics(pred_t1, pred_t2, gt_t1, gt_t2, num_classes, ignore_index=255):
     """Compute per-class IoU and F1 for semantic segmentation (all pixels).
     

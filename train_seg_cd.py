@@ -37,7 +37,7 @@ from misc.metric_tools import ConfuseMatrixMeter
 from misc.torchutils import get_scheduler, save_network  # keep compatibility
 from models.loss import *            # noqa: F401,F403
 from models.loss import MultiClassCDLoss  # explicit import
-from core.metrics import compute_semantic_metrics_on_changed, compute_per_class_metrics, compute_transition_metrics
+from core.metrics import compute_semantic_metrics_on_changed, compute_semantic_metrics_on_predicted_changed, compute_per_class_metrics, compute_transition_metrics
 
 
 # ----------------------------- helpers ----------------------------- #
@@ -703,10 +703,25 @@ def main():
                 seg_t1_np = seg_t1.cpu().numpy()
                 seg_t2_np = seg_t2.cpu().numpy()
                 
-                # Metrics on changed pixels only
+                # Metrics on GT changed pixels
                 changed_metrics = compute_semantic_metrics_on_changed(
                     pred1_np, pred2_np, seg_t1_np, seg_t2_np, num_classes, ignore_index
                 )
+                
+                # Metrics on PREDICTED changed pixels
+                if change_pred is not None:
+                    # Get predicted change mask from last batch
+                    if change_pred.size(1) == 2:
+                        pred_chg_mask = torch.argmax(change_pred, dim=1)
+                    else:
+                        pred_chg_mask = (torch.sigmoid(change_pred[:, 0]) > args.change_threshold).long()
+                    pred_chg_mask_np = pred_chg_mask.cpu().numpy()
+                    
+                    pred_changed_metrics = compute_semantic_metrics_on_predicted_changed(
+                        pred1_np, pred2_np, seg_t1_np, seg_t2_np, pred_chg_mask_np, num_classes, ignore_index
+                    )
+                else:
+                    pred_changed_metrics = {'iou': 0.0, 'f1': 0.0, 'accuracy': 0.0, 'num_pixels': 0}
                 
                 # Per-class metrics
                 per_class_metrics = compute_per_class_metrics(
@@ -720,6 +735,7 @@ def main():
                 )
             else:
                 changed_metrics = {'iou': 0.0, 'f1': 0.0, 'accuracy': 0.0}
+                pred_changed_metrics = {'iou': 0.0, 'f1': 0.0, 'accuracy': 0.0, 'num_pixels': 0}
                 per_class_metrics = {'iou_per_class': [0.0]*num_classes, 'f1_per_class': [0.0]*num_classes}
                 transition_metrics = {}
 
@@ -742,10 +758,15 @@ def main():
                 'train/epoch_change_f1': chg_f1,
                 'train/epoch_change_iou': chg_iou,
                 'train/epoch_change_acc': chg_acc,
-                # Metrics on changed pixels only
-                'train/changed_pixels_iou': changed_metrics['iou'],
-                'train/changed_pixels_f1': changed_metrics['f1'],
-                'train/changed_pixels_acc': changed_metrics['accuracy'],
+                # Metrics on GT changed pixels (ground truth change mask)
+                'train/changed_pixels_gt_iou': changed_metrics['iou'],
+                'train/changed_pixels_gt_f1': changed_metrics['f1'],
+                'train/changed_pixels_gt_acc': changed_metrics['accuracy'],
+                # Metrics on PREDICTED changed pixels (predicted change mask)
+                'train/changed_pixels_pred_iou': pred_changed_metrics['iou'],
+                'train/changed_pixels_pred_f1': pred_changed_metrics['f1'],
+                'train/changed_pixels_pred_acc': pred_changed_metrics['accuracy'],
+                'train/changed_pixels_pred_count': pred_changed_metrics['num_pixels'],
                 # Per-class metrics (key classes: building=4, nvg_surf=1, water=3, playground=5)
                 'train/class_building_iou': per_class_metrics['iou_per_class'][4] if len(per_class_metrics['iou_per_class']) > 4 else 0.0,
                 'train/class_building_f1': per_class_metrics['f1_per_class'][4] if len(per_class_metrics['f1_per_class']) > 4 else 0.0,
@@ -855,9 +876,19 @@ def main():
                     y1_np = y1.cpu().numpy()
                     y2_np = y2.cpu().numpy()
                     
+                    # Metrics on GT changed pixels
                     val_changed_metrics = compute_semantic_metrics_on_changed(
                         p1_np, p2_np, y1_np, y2_np, num_classes, ignore_index
                     )
+                    
+                    # Metrics on PREDICTED changed pixels
+                    if v_change is not None:
+                        chg_mask_np = chg_mask.cpu().numpy()  # Already computed above
+                        val_pred_changed_metrics = compute_semantic_metrics_on_predicted_changed(
+                            p1_np, p2_np, y1_np, y2_np, chg_mask_np, num_classes, ignore_index
+                        )
+                    else:
+                        val_pred_changed_metrics = {'iou': 0.0, 'f1': 0.0, 'accuracy': 0.0, 'num_pixels': 0}
                     
                     val_per_class_metrics = compute_per_class_metrics(
                         p1_np, p2_np, y1_np, y2_np, num_classes, ignore_index
@@ -869,6 +900,7 @@ def main():
                     )
                 else:
                     val_changed_metrics = {'iou': 0.0, 'f1': 0.0, 'accuracy': 0.0}
+                    val_pred_changed_metrics = {'iou': 0.0, 'f1': 0.0, 'accuracy': 0.0, 'num_pixels': 0}
                     val_per_class_metrics = {'iou_per_class': [0.0]*num_classes, 'f1_per_class': [0.0]*num_classes}
                     val_transition_metrics = {}
 
@@ -895,10 +927,15 @@ def main():
                     'val/epoch_change_f1': v_chg_f1,
                     'val/epoch_change_iou': v_chg_iou,
                     'val/epoch_change_acc': v_chg_acc,
-                    # Metrics on changed pixels only
-                    'val/changed_pixels_iou': val_changed_metrics['iou'],
-                    'val/changed_pixels_f1': val_changed_metrics['f1'],
-                    'val/changed_pixels_acc': val_changed_metrics['accuracy'],
+                    # Metrics on GT changed pixels (ground truth change mask)
+                    'val/changed_pixels_gt_iou': val_changed_metrics['iou'],
+                    'val/changed_pixels_gt_f1': val_changed_metrics['f1'],
+                    'val/changed_pixels_gt_acc': val_changed_metrics['accuracy'],
+                    # Metrics on PREDICTED changed pixels (predicted change mask)
+                    'val/changed_pixels_pred_iou': val_pred_changed_metrics['iou'],
+                    'val/changed_pixels_pred_f1': val_pred_changed_metrics['f1'],
+                    'val/changed_pixels_pred_acc': val_pred_changed_metrics['accuracy'],
+                    'val/changed_pixels_pred_count': val_pred_changed_metrics['num_pixels'],
                     # Per-class metrics
                     'val/class_building_iou': val_per_class_metrics['iou_per_class'][4] if len(val_per_class_metrics['iou_per_class']) > 4 else 0.0,
                     'val/class_building_f1': val_per_class_metrics['f1_per_class'][4] if len(val_per_class_metrics['f1_per_class']) > 4 else 0.0,
