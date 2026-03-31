@@ -27,6 +27,7 @@ import numpy as np
 import random
 from tqdm import tqdm
 import wandb
+from PIL import Image
 
 # project deps
 import data as Data
@@ -98,6 +99,73 @@ def unpack_outputs(outputs):
     return seg1, seg2, change, aux
 
 
+def save_test_images(save_dir, img_name, seg_t1, seg_t2, change_mask_pred, change_mask_gt, colormap, num_classes):
+    """
+    Save test results as images in 4 subfolders:
+    1. seg_full: Full segmentation results (T1 and T2) in colormap
+    2. seg_gt_change_masked: Segmentation masked with GT change mask
+    3. seg_pred_change_masked: Segmentation masked with predicted change mask
+    4. change_masks: Binary change masks (GT and predicted)
+    
+    Args:
+        save_dir: Base directory for saving images
+        img_name: Original image name (without extension) for filename
+        seg_t1: Segmentation prediction for T1 [H, W] (numpy array, class indices)
+        seg_t2: Segmentation prediction for T2 [H, W] (numpy array, class indices)
+        change_mask_pred: Predicted binary change mask [H, W] (numpy array, 0/1)
+        change_mask_gt: Ground truth binary change mask [H, W] (numpy array, 0/1)
+        colormap: List of RGB colors for each class
+        num_classes: Number of semantic classes
+    """
+    from core.utils import create_color_mask
+    
+    # Create subdirectories
+    seg_full_dir = os.path.join(save_dir, 'seg_full')
+    seg_gt_masked_dir = os.path.join(save_dir, 'seg_gt_change_masked')
+    seg_pred_masked_dir = os.path.join(save_dir, 'seg_pred_change_masked')
+    change_masks_dir = os.path.join(save_dir, 'change_masks')
+    
+    os.makedirs(seg_full_dir, exist_ok=True)
+    os.makedirs(seg_gt_masked_dir, exist_ok=True)
+    os.makedirs(seg_pred_masked_dir, exist_ok=True)
+    os.makedirs(change_masks_dir, exist_ok=True)
+    
+    # 1. Save full segmentation results
+    seg_t1_color = create_color_mask(seg_t1, num_classes, colormap)
+    seg_t2_color = create_color_mask(seg_t2, num_classes, colormap)
+    Image.fromarray(seg_t1_color).save(os.path.join(seg_full_dir, f'{img_name}_t1.png'))
+    Image.fromarray(seg_t2_color).save(os.path.join(seg_full_dir, f'{img_name}_t2.png'))
+    
+    # 2. Save segmentation masked with GT change mask
+    seg_t1_gt_masked = seg_t1.copy()
+    seg_t2_gt_masked = seg_t2.copy()
+    seg_t1_gt_masked[change_mask_gt == 0] = 0  # Set unchanged pixels to background class
+    seg_t2_gt_masked[change_mask_gt == 0] = 0
+    seg_t1_gt_color = create_color_mask(seg_t1_gt_masked, num_classes, colormap)
+    seg_t2_gt_color = create_color_mask(seg_t2_gt_masked, num_classes, colormap)
+    Image.fromarray(seg_t1_gt_color).save(os.path.join(seg_gt_masked_dir, f'{img_name}_t1.png'))
+    Image.fromarray(seg_t2_gt_color).save(os.path.join(seg_gt_masked_dir, f'{img_name}_t2.png'))
+    
+    # 3. Save segmentation masked with predicted change mask
+    if change_mask_pred is not None:
+        seg_t1_pred_masked = seg_t1.copy()
+        seg_t2_pred_masked = seg_t2.copy()
+        seg_t1_pred_masked[change_mask_pred == 0] = 0
+        seg_t2_pred_masked[change_mask_pred == 0] = 0
+        seg_t1_pred_color = create_color_mask(seg_t1_pred_masked, num_classes, colormap)
+        seg_t2_pred_color = create_color_mask(seg_t2_pred_masked, num_classes, colormap)
+        Image.fromarray(seg_t1_pred_color).save(os.path.join(seg_pred_masked_dir, f'{img_name}_t1.png'))
+        Image.fromarray(seg_t2_pred_color).save(os.path.join(seg_pred_masked_dir, f'{img_name}_t2.png'))
+    
+    # 4. Save binary change masks (as grayscale images: 0=black, 255=white)
+    change_gt_img = (change_mask_gt * 255).astype(np.uint8)
+    Image.fromarray(change_gt_img).save(os.path.join(change_masks_dir, f'{img_name}_gt.png'))
+    
+    if change_mask_pred is not None:
+        change_pred_img = (change_mask_pred * 255).astype(np.uint8)
+        Image.fromarray(change_pred_img).save(os.path.join(change_masks_dir, f'{img_name}_pred.png'))
+
+
 # ----------------------------- main ----------------------------- #
 def main():
     parser = argparse.ArgumentParser()
@@ -111,6 +179,7 @@ def main():
     parser.add_argument('--wandb_project', type=str, default='')
     parser.add_argument('--max_test_batches', type=int, default=-1)
     parser.add_argument('--change_threshold', type=float, default=0.5, help='Threshold for binary change (if using sigmoid)')
+    parser.add_argument('--save_images', type=str, default=None, help='Directory to save test result images')
     args = parser.parse_args()
 
     # Parse config
@@ -199,6 +268,15 @@ def main():
     logger.info("Starting comprehensive testing")
     logger.info("=" * 80)
     
+    # Setup image saving if requested
+    if args.save_images:
+        os.makedirs(args.save_images, exist_ok=True)
+        logger.info(f"Image saving enabled: {args.save_images}")
+        logger.info("  - seg_full: Full segmentation results")
+        logger.info("  - seg_gt_change_masked: Segmentation masked with GT change")
+        logger.info("  - seg_pred_change_masked: Segmentation masked with predicted change")
+        logger.info("  - change_masks: Binary change masks (GT and predicted)")
+    
     cd_model.eval()
     test_metric = ConfuseMatrixMeter(n_class=num_classes)
     test_tp = test_fp = test_fn = test_tn = 0
@@ -261,6 +339,45 @@ def main():
             all_p2.append(p2.cpu().numpy())
             all_y1.append(y1.cpu().numpy())
             all_y2.append(y2.cpu().numpy())
+            
+            # Save images if requested
+            if args.save_images:
+                batch_size = p1.size(0)
+                # Get image names from batch
+                img_names = tb.get('name', [f'sample_{tstep}_{b}' for b in range(batch_size)])
+                
+                for b in range(batch_size):
+                    # Get image name (handle both list and single string cases)
+                    if isinstance(img_names, list):
+                        img_name = img_names[b] if b < len(img_names) else f'sample_{tstep}_{b}'
+                    else:
+                        img_name = img_names if batch_size == 1 else f'sample_{tstep}_{b}'
+                    
+                    # Remove file extension if present
+                    img_name = os.path.splitext(img_name)[0]
+                    
+                    # Extract single sample from batch
+                    seg_t1_np = p1[b].cpu().numpy()
+                    seg_t2_np = p2[b].cpu().numpy()
+                    gt_change_np = derive_change_bin(y1[b:b+1], y2[b:b+1])[0].cpu().numpy()
+                    
+                    # Get predicted change mask if available
+                    if change_pred is not None:
+                        pred_change_np = chg_mask[b].cpu().numpy()
+                    else:
+                        pred_change_np = None
+                    
+                    # Save images
+                    save_test_images(
+                        args.save_images,
+                        img_name,
+                        seg_t1_np,
+                        seg_t2_np,
+                        pred_change_np,
+                        gt_change_np,
+                        colormap,
+                        num_classes
+                    )
 
     # ----------------------------- compute metrics ----------------------------- #
     logger.info("Computing comprehensive metrics...")
@@ -339,6 +456,88 @@ def main():
     logger.info(f"  Acc:   {test_pred_changed_metrics['accuracy']:.4f}")
     logger.info(f"  Count: {test_pred_changed_metrics['num_pixels']}")
     logger.info("=" * 80)
+
+    # Save metrics to text file if save_images is enabled
+    if args.save_images:
+        metrics_file = os.path.join(args.save_images, 'test_metrics.txt')
+        with open(metrics_file, 'w') as f:
+            f.write("=" * 80 + "\n")
+            f.write("TEST RESULTS - QUANTITATIVE METRICS\n")
+            f.write("=" * 80 + "\n\n")
+            
+            # Overall semantic segmentation
+            f.write("Overall Semantic Segmentation:\n")
+            f.write(f"  mF1:  {test_mf1:.4f}\n")
+            f.write(f"  mIoU: {test_miou:.4f}\n")
+            f.write(f"  OA:   {test_acc:.4f}\n\n")
+            
+            # Binary change detection
+            f.write("Binary Change Detection:\n")
+            f.write(f"  Precision: {test_chg_prec:.4f}\n")
+            f.write(f"  Recall:    {test_chg_rec:.4f}\n")
+            f.write(f"  F1:        {test_chg_f1:.4f}\n")
+            f.write(f"  IoU:       {test_chg_iou:.4f}\n")
+            f.write(f"  Accuracy:  {test_chg_acc:.4f}\n\n")
+            
+            # Semantic on GT changed pixels
+            f.write("Semantic Segmentation on GT Changed Pixels:\n")
+            f.write(f"  IoU: {test_changed_metrics['iou']:.4f}\n")
+            f.write(f"  F1:  {test_changed_metrics['f1']:.4f}\n")
+            f.write(f"  Acc: {test_changed_metrics['accuracy']:.4f}\n\n")
+            
+            # Semantic on predicted changed pixels
+            f.write("Semantic Segmentation on PREDICTED Changed Pixels:\n")
+            f.write(f"  IoU:   {test_pred_changed_metrics['iou']:.4f}\n")
+            f.write(f"  F1:    {test_pred_changed_metrics['f1']:.4f}\n")
+            f.write(f"  Acc:   {test_pred_changed_metrics['accuracy']:.4f}\n")
+            f.write(f"  Count: {test_pred_changed_metrics['num_pixels']}\n\n")
+            
+            # Per-class metrics
+            f.write("Per-Class Metrics:\n")
+            if 'iou_per_class' in test_per_class_metrics:
+                f.write("  IoU per class:\n")
+                for cls_idx, iou_val in enumerate(test_per_class_metrics['iou_per_class']):
+                    f.write(f"    Class {cls_idx}: {iou_val:.4f}\n")
+            if 'f1_per_class' in test_per_class_metrics:
+                f.write("  F1 per class:\n")
+                for cls_idx, f1_val in enumerate(test_per_class_metrics['f1_per_class']):
+                    f.write(f"    Class {cls_idx}: {f1_val:.4f}\n")
+            if 'accuracy_per_class' in test_per_class_metrics:
+                f.write("  Accuracy per class:\n")
+                for cls_idx, acc_val in enumerate(test_per_class_metrics['accuracy_per_class']):
+                    f.write(f"    Class {cls_idx}: {acc_val:.4f}\n")
+            f.write("\n")
+            
+            # Transition metrics
+            if test_transition_metrics:
+                f.write("Transition Metrics (Class A -> Class B):\n")
+                for trans_key, trans_val in test_transition_metrics.items():
+                    f.write(f"  {trans_key}:\n")
+                    f.write(f"    Accuracy: {trans_val['accuracy']:.4f}\n")
+                    f.write(f"    Count:    {trans_val['count']}\n")
+                f.write("\n")
+            
+            # Overall per-class metrics from confusion matrix
+            if 'f1_per_class' in test_scores:
+                f.write("Overall Per-Class F1 (from confusion matrix):\n")
+                for cls_idx, f1_val in enumerate(test_scores['f1_per_class']):
+                    f.write(f"  Class {cls_idx}: {f1_val:.4f}\n")
+                f.write("\n")
+            
+            if 'iou_per_class' in test_scores:
+                f.write("Overall Per-Class IoU (from confusion matrix):\n")
+                for cls_idx, iou_val in enumerate(test_scores['iou_per_class']):
+                    f.write(f"  Class {cls_idx}: {iou_val:.4f}\n")
+                f.write("\n")
+            
+            f.write("=" * 80 + "\n")
+            f.write(f"Test completed on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Model weights: {args.weights}\n")
+            f.write(f"Config: {args.config}\n")
+            f.write(f"Dataset: {args.dataset}\n")
+            f.write("=" * 80 + "\n")
+        
+        logger.info(f"✓ Metrics saved to: {metrics_file}")
 
     # W&B logging
     if use_wandb:
