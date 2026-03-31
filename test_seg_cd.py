@@ -284,6 +284,8 @@ def main():
     
     cd_model.eval()
     test_metric = ConfuseMatrixMeter(n_class=num_classes)
+    test_metric_gt_masked = ConfuseMatrixMeter(n_class=num_classes)  # For GT change masked
+    test_metric_pred_masked = ConfuseMatrixMeter(n_class=num_classes)  # For pred change masked
     test_tp = test_fp = test_fn = test_tn = 0
 
     _max_test = args.max_test_batches
@@ -315,13 +317,14 @@ def main():
             test_metric.update_cm(pr=safe_to_numpy_uint8(p2), gt=safe_to_numpy_uint8(y2))
 
             # Change detection metrics
+            gt_change = derive_change_bin(y1, y2)
+            
             if change_pred is not None:
                 if change_pred.size(1) == 2:
                     chg_mask = torch.argmax(change_pred, dim=1)
                 else:
                     chg_mask = (torch.sigmoid(change_pred[:, 0]) > args.change_threshold).long()
                 
-                gt_change = derive_change_bin(y1, y2)
                 pr_np, gt_np = chg_mask.cpu().numpy(), gt_change.cpu().numpy()
                 
                 tp = np.logical_and(pr_np == 1, gt_np == 1).sum()
@@ -336,8 +339,36 @@ def main():
 
                 # Store for aggregated metrics
                 all_chg_mask.append(chg_mask.cpu().numpy())
+                
+                # Update metrics for pred-masked segmentation
+                # Only evaluate on pixels predicted as changed
+                p1_masked = p1.clone()
+                p2_masked = p2.clone()
+                y1_masked = y1.clone()
+                y2_masked = y2.clone()
+                # Set unchanged pixels to ignore_index
+                p1_masked[chg_mask == 0] = ignore_index
+                p2_masked[chg_mask == 0] = ignore_index
+                y1_masked[chg_mask == 0] = ignore_index
+                y2_masked[chg_mask == 0] = ignore_index
+                test_metric_pred_masked.update_cm(pr=safe_to_numpy_uint8(p1_masked), gt=safe_to_numpy_uint8(y1_masked))
+                test_metric_pred_masked.update_cm(pr=safe_to_numpy_uint8(p2_masked), gt=safe_to_numpy_uint8(y2_masked))
             else:
                 all_chg_mask.append(None)
+            
+            # Update metrics for GT-masked segmentation
+            # Only evaluate on pixels that actually changed
+            p1_gt_masked = p1.clone()
+            p2_gt_masked = p2.clone()
+            y1_gt_masked = y1.clone()
+            y2_gt_masked = y2.clone()
+            # Set unchanged pixels to ignore_index
+            p1_gt_masked[gt_change == 0] = ignore_index
+            p2_gt_masked[gt_change == 0] = ignore_index
+            y1_gt_masked[gt_change == 0] = ignore_index
+            y2_gt_masked[gt_change == 0] = ignore_index
+            test_metric_gt_masked.update_cm(pr=safe_to_numpy_uint8(p1_gt_masked), gt=safe_to_numpy_uint8(y1_gt_masked))
+            test_metric_gt_masked.update_cm(pr=safe_to_numpy_uint8(p2_gt_masked), gt=safe_to_numpy_uint8(y2_gt_masked))
 
             # Store predictions and GT for aggregated metrics
             all_p1.append(p1.cpu().numpy())
@@ -433,6 +464,19 @@ def main():
     test_transition_metrics = compute_transition_metrics(
         all_p1_np, all_p2_np, all_y1_np, all_y2_np, top_transitions, num_classes, ignore_index
     )
+    
+    # Get SeK and OA for GT-masked and pred-masked segmentations
+    test_scores_gt_masked = test_metric_gt_masked.get_scores()
+    test_sek_gt_masked = test_scores_gt_masked.get('SCD_Sek', 0.0)
+    test_oa_gt_masked = test_scores_gt_masked.get('acc', 0.0)
+    test_miou_gt_masked = test_scores_gt_masked.get('miou', 0.0)
+    test_mf1_gt_masked = test_scores_gt_masked.get('mf1', 0.0)
+    
+    test_scores_pred_masked = test_metric_pred_masked.get_scores()
+    test_sek_pred_masked = test_scores_pred_masked.get('SCD_Sek', 0.0)
+    test_oa_pred_masked = test_scores_pred_masked.get('acc', 0.0)
+    test_miou_pred_masked = test_scores_pred_masked.get('miou', 0.0)
+    test_mf1_pred_masked = test_scores_pred_masked.get('mf1', 0.0)
 
     # ----------------------------- logging ----------------------------- #
     logger.info("=" * 80)
@@ -460,6 +504,18 @@ def main():
     logger.info(f"  F1:    {test_pred_changed_metrics['f1']:.4f}")
     logger.info(f"  Acc:   {test_pred_changed_metrics['accuracy']:.4f}")
     logger.info(f"  Count: {test_pred_changed_metrics['num_pixels']}")
+    logger.info(f"")
+    logger.info(f"Segmentation Masked by GT Change (SeK & OA):")
+    logger.info(f"  SeK:  {test_sek_gt_masked:.4f}")
+    logger.info(f"  OA:   {test_oa_gt_masked:.4f}")
+    logger.info(f"  mIoU: {test_miou_gt_masked:.4f}")
+    logger.info(f"  mF1:  {test_mf1_gt_masked:.4f}")
+    logger.info(f"")
+    logger.info(f"Segmentation Masked by Predicted Change (SeK & OA):")
+    logger.info(f"  SeK:  {test_sek_pred_masked:.4f}")
+    logger.info(f"  OA:   {test_oa_pred_masked:.4f}")
+    logger.info(f"  mIoU: {test_miou_pred_masked:.4f}")
+    logger.info(f"  mF1:  {test_mf1_pred_masked:.4f}")
     logger.info("=" * 80)
 
     # Save metrics to text file if save_images is enabled
@@ -496,6 +552,20 @@ def main():
             f.write(f"  F1:    {test_pred_changed_metrics['f1']:.4f}\n")
             f.write(f"  Acc:   {test_pred_changed_metrics['accuracy']:.4f}\n")
             f.write(f"  Count: {test_pred_changed_metrics['num_pixels']}\n\n")
+            
+            # Segmentation masked by GT change
+            f.write("Segmentation Masked by GT Change (SeK & OA):\n")
+            f.write(f"  SeK:  {test_sek_gt_masked:.4f}\n")
+            f.write(f"  OA:   {test_oa_gt_masked:.4f}\n")
+            f.write(f"  mIoU: {test_miou_gt_masked:.4f}\n")
+            f.write(f"  mF1:  {test_mf1_gt_masked:.4f}\n\n")
+            
+            # Segmentation masked by predicted change
+            f.write("Segmentation Masked by Predicted Change (SeK & OA):\n")
+            f.write(f"  SeK:  {test_sek_pred_masked:.4f}\n")
+            f.write(f"  OA:   {test_oa_pred_masked:.4f}\n")
+            f.write(f"  mIoU: {test_miou_pred_masked:.4f}\n")
+            f.write(f"  mF1:  {test_mf1_pred_masked:.4f}\n\n")
             
             # Per-class metrics
             f.write("Per-Class Metrics:\n")
