@@ -164,6 +164,11 @@ def save_test_images(save_dir, img_name, seg_t1, seg_t2, change_mask_pred, chang
     if change_mask_pred is not None:
         change_pred_img = (change_mask_pred * 255).astype(np.uint8)
         Image.fromarray(change_pred_img).save(os.path.join(change_masks_dir, f'{img_name}_pred.png'))
+    
+    # 5. Save derived binary change mask from segmentation (T1 != T2)
+    change_derived = (seg_t1 != seg_t2).astype(np.uint8)
+    change_derived_img = (change_derived * 255).astype(np.uint8)
+    Image.fromarray(change_derived_img).save(os.path.join(change_masks_dir, f'{img_name}_derived_from_seg.png'))
 
 
 # ----------------------------- main ----------------------------- #
