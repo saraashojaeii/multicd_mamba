@@ -1131,7 +1131,7 @@ class SemanticChangeConsistencyLoss(nn.Module):
         Args:
             seg_logits_t1: [B, C, H, W] - semantic logits for T1
             seg_logits_t2: [B, C, H, W] - semantic logits for T2
-            change_logits: [B, 2, H, W] - binary change logits [no-change, change]
+            change_logits: [B, 1, H, W] - binary change logit (sigmoid-based)
             seg_gt_t1: [B, H, W] - optional ground truth for T1 (for masking)
             seg_gt_t2: [B, H, W] - optional ground truth for T2 (for masking)
             
@@ -1165,7 +1165,7 @@ class SemanticChangeConsistencyLoss(nn.Module):
             semantic_change_map = (seg_pred_t1 != seg_pred_t2).float().unsqueeze(1)  # [B, 1, H, W]
         
         # Get binary change predictions
-        change_prob = F.softmax(change_logits, dim=1)[:, 1:2]  # [B, 1, H, W] - probability of change
+        change_prob = torch.sigmoid(change_logits)  # [B, 1, H, W] - probability of change
         
         # Create mask for valid pixels
         valid_mask = torch.ones_like(semantic_change_map)

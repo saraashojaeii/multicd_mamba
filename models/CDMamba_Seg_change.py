@@ -533,12 +533,13 @@ class CDMamba_seg_cd(nn.Module):
         )
         
         if self.use_change_head:
-            # Output 2 channels: [no-change, change]
-            # Now expects features from the dedicated change decoder (C = init_filters)
+            # Output 1 channel: change probability logit (sigmoid-based)
+            # Using a single channel is consistent with BCE+Dice training and avoids
+            # the softmax-vs-sigmoid mismatch that caused the 2-channel design to fail.
             self.change_head = nn.Sequential(
                 get_norm_layer(name=self.norm, spatial_dims=self.spatial_dims, channels=self.init_filters),
                 self.act_mod,
-                get_conv_layer(self.spatial_dims, self.init_filters, 2, kernel_size=1, bias=True),
+                get_conv_layer(self.spatial_dims, self.init_filters, 1, kernel_size=1, bias=True),
             )
 
         if dropout_prob is not None:
@@ -740,32 +741,24 @@ class CDMamba_seg_cd(nn.Module):
                 
                 # Change-guided gating: force semantic heads to focus on change-relevant regions
                 if self.use_change_gating:
-                    # Compute soft change probability mask
-                    if change_logits.size(1) == 2:
-                        # 2-channel output: [no-change, change]
-                        change_prob = F.softmax(change_logits, dim=1)[:, 1:2]  # [B, 1, H, W]
-                    else:
-                        # 1-channel output: sigmoid
-                        change_prob = torch.sigmoid(change_logits)  # [B, 1, H, W]
+                    # 1-channel logit → sigmoid probability [B, 1, H, W]
+                    change_prob = torch.sigmoid(change_logits)
                     
                     # Resize change_prob to match decoder feature spatial size
                     if change_prob.shape[2:] != seg1.shape[2:]:
                         change_prob = F.interpolate(
-                            change_prob, 
-                            size=seg1.shape[2:], 
+                            change_prob,
+                            size=seg1.shape[2:],
                             mode='bilinear' if self.spatial_dims == 2 else 'trilinear',
                             align_corners=False
                         )
-                    
+
                     # Apply gating to decoder features before segmentation heads
                     if self.change_gate_mode == "additive":
                         # Additive gating: dec_gated = dec * (1 + alpha * change_prob)
-                        # Amplifies features in changed regions
                         seg1_gated = seg1 * (1.0 + self.change_gate_alpha * change_prob)
                         seg2_gated = seg2 * (1.0 + self.change_gate_alpha * change_prob)
                     else:  # multiplicative
-                        # Multiplicative gating: dec_gated = dec * (beta + (1-beta) * change_prob)
-                        # Suppresses unchanged regions more strongly (beta ~ 0.2)
                         gate = self.change_gate_beta + (1.0 - self.change_gate_beta) * change_prob
                         seg1_gated = seg1 * gate
                         seg2_gated = seg2 * gate

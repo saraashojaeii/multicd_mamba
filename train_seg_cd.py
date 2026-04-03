@@ -130,13 +130,9 @@ def log_first_batch_to_wandb(prefix, batch, seg_t1, seg_t2, seg_logits_t1, seg_l
     chg_gt = derive_change_bin(seg_t1, seg_t2)[0].cpu().numpy() * 255
     d[f"{prefix}/gt_change"] = [wandb.Image(chg_gt)]
     if change_pred is not None:
-        if change_pred.size(1) == 2:
-            change_probs = torch.softmax(change_pred[0], dim=0)[1].detach().cpu().numpy() * 255
-            change_mask = torch.argmax(change_pred[0], dim=0).detach().cpu().numpy() * 255
-        else:
-            p = torch.sigmoid(change_pred[0, 0]).detach().cpu().numpy()
-            change_probs = (p * 255)
-            change_mask = ((p > 0.5).astype(np.uint8) * 255)
+        p = torch.sigmoid(change_pred[0, 0]).detach().cpu().numpy()
+        change_probs = (p * 255)
+        change_mask = ((p > 0.5).astype(np.uint8) * 255)
         d[f"{prefix}/pred_change_prob"] = [wandb.Image(change_probs)]
         d[f"{prefix}/pred_change_mask"] = [wandb.Image(change_mask)]
 
@@ -637,7 +633,7 @@ def main():
                             b, c, h, w = seg_logits_t1.shape
                             change_pred = torch.zeros((b, 1, h, w), device=seg_logits_t1.device)
                         change_bin = derive_change_bin(seg_t1, seg_t2)
-                        preds = (seg_logits_t1, seg_logits_t2, change_pred[:, 1:2] if change_pred.size(1) == 2 else change_pred)
+                        preds = (seg_logits_t1, seg_logits_t2, change_pred)
                         targets = {'seg_t1': seg_t1, 'seg_t2': seg_t2, 'change': change_bin}
                         loss, _ = loss_fun(preds, targets)
                     else:
@@ -671,10 +667,7 @@ def main():
                     metric_seg.update_cm(pr=safe_to_numpy_uint8(pred2), gt=safe_to_numpy_uint8(seg_t2))
 
                     if change_pred is not None:
-                        if change_pred.size(1) == 2:
-                            chg_mask = torch.argmax(change_pred, dim=1)
-                        else:
-                            chg_mask = (torch.sigmoid(change_pred[:, 0]) > args.change_threshold).long()
+                        chg_mask = (torch.sigmoid(change_pred[:, 0]) > args.change_threshold).long()
                         gt_bin = derive_change_bin(seg_t1, seg_t2)
                         pr_np, gt_np = chg_mask.cpu().numpy(), gt_bin.cpu().numpy()
                         tp = np.logical_and(pr_np == 1, gt_np == 1).sum()
@@ -711,10 +704,7 @@ def main():
                 # Metrics on PREDICTED changed pixels
                 if change_pred is not None:
                     # Get predicted change mask from last batch
-                    if change_pred.size(1) == 2:
-                        pred_chg_mask = torch.argmax(change_pred, dim=1)
-                    else:
-                        pred_chg_mask = (torch.sigmoid(change_pred[:, 0]) > args.change_threshold).long()
+                    pred_chg_mask = (torch.sigmoid(change_pred[:, 0]) > args.change_threshold).long()
                     pred_chg_mask_np = pred_chg_mask.cpu().numpy()
                     
                     pred_changed_metrics = compute_semantic_metrics_on_predicted_changed(
@@ -828,7 +818,7 @@ def main():
                         if loss_type == 'multi_class_cd':
                             v_loss, _ = loss_fun((v_seg1, v_seg2, v_change), {'seg_t1': y1, 'seg_t2': y2, 'change': derive_change_bin(y1, y2)})
                         elif loss_type == 'extended_triplet':
-                            v_change_1ch = v_change[:, 1:2] if (v_change is not None and v_change.size(1) == 2) else (v_change if v_change is not None else torch.zeros((v_seg1.size(0), 1, v_seg1.size(2), v_seg1.size(3)), device=v_seg1.device))
+                            v_change_1ch = v_change if v_change is not None else torch.zeros((v_seg1.size(0), 1, v_seg1.size(2), v_seg1.size(3)), device=v_seg1.device)
                             v_loss, _ = loss_fun((v_seg1, v_seg2, v_change_1ch), {'seg_t1': y1, 'seg_t2': y2, 'change': derive_change_bin(y1, y2)})
                         else:
                             l1 = loss_fun(v_seg1, y1) if isinstance(loss_fun, nn.Module) else loss_fun(v_seg1, y1)
@@ -848,10 +838,7 @@ def main():
 
                         # change metrics
                         if v_change is not None:
-                            if v_change.size(1) == 2:
-                                chg_mask = torch.argmax(v_change, dim=1)
-                            else:
-                                chg_mask = (torch.sigmoid(v_change[:, 0]) > args.change_threshold).long()
+                            chg_mask = (torch.sigmoid(v_change[:, 0]) > args.change_threshold).long()
                             gt = derive_change_bin(y1, y2)
                             pr_np, gt_np = chg_mask.cpu().numpy(), gt.cpu().numpy()
                             tp = np.logical_and(pr_np == 1, gt_np == 1).sum()
@@ -1018,10 +1005,7 @@ def main():
                 test_metric.update_cm(pr=safe_to_numpy_uint8(p2), gt=safe_to_numpy_uint8(y2))
 
                 if chg is not None:
-                    if chg.size(1) == 2:
-                        cmask = torch.argmax(chg, dim=1)
-                    else:
-                        cmask = (torch.sigmoid(chg[:, 0]) > args.change_threshold).long()
+                    cmask = (torch.sigmoid(chg[:, 0]) > args.change_threshold).long()
                     gt = derive_change_bin(y1, y2)
                     pr_np, gt_np = cmask.cpu().numpy(), gt.cpu().numpy()
                     tp = np.logical_and(pr_np == 1, gt_np == 1).sum()

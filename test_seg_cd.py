@@ -320,10 +320,7 @@ def main():
             gt_change = derive_change_bin(y1, y2)
             
             if change_pred is not None:
-                if change_pred.size(1) == 2:
-                    chg_mask = torch.argmax(change_pred, dim=1)
-                else:
-                    chg_mask = (torch.sigmoid(change_pred[:, 0]) > args.change_threshold).long()
+                chg_mask = (torch.sigmoid(change_pred[:, 0]) > args.change_threshold).long()
                 
                 pr_np, gt_np = chg_mask.cpu().numpy(), gt_change.cpu().numpy()
                 
