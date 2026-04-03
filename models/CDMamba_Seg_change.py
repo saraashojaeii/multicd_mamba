@@ -10,770 +10,772 @@ from monai.networks.layers.utils import get_act_layer, get_norm_layer
 from monai.utils import UpsampleMode
 from models.mamba_customer import ConvMamba
 
+
+# ---------------------------------------------------------------------------
+# Primitive building blocks
+# ---------------------------------------------------------------------------
+
 class ContextBlock2D(nn.Module):
+    """
+    Bottleneck context module: fuses local dilated features with a global
+    average-pool branch to capture both fine-grained structure and scene-level context.
+
+    Input / output shape: [B, C, H, W]
+    """
     def __init__(self, ch, norm_layer, act):
         super().__init__()
         self.local = nn.Sequential(
             nn.Conv2d(ch, ch, 3, padding=1, dilation=1, bias=False),
-            norm_layer(ch),
-            act,
+            norm_layer(ch), act,
             nn.Conv2d(ch, ch, 3, padding=2, dilation=2, bias=False),
-            norm_layer(ch),
-            act,
+            norm_layer(ch), act,
         )
         self.global_branch = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(ch, ch, 1, bias=False),
-            act,
+            nn.Conv2d(ch, ch, 1, bias=False), act,
         )
         self.fuse = nn.Sequential(
             nn.Conv2d(ch * 2, ch, 1, bias=False),
-            norm_layer(ch),
-            act,
+            norm_layer(ch), act,
         )
 
     def forward(self, x):
-        loc = self.local(x)                            # [B, C, H, W]
-        glob = self.global_branch(x)                   # [B, C, 1, 1]
-        glob = F.interpolate(glob, size=x.shape[2:], mode="bilinear", align_corners=False)
+        loc  = self.local(x)                                                         # [B, C, H, W]
+        glob = F.interpolate(self.global_branch(x), size=x.shape[2:],
+                             mode="bilinear", align_corners=False)                   # [B, C, H, W]
         return self.fuse(torch.cat([loc, glob], dim=1))
 
+
 class ConvPosEnc(nn.Module):
+    """Depthwise-conv positional encoding: adds a locally-smoothed bias to x."""
     def __init__(self, dim, k=3):
         super().__init__()
-        padding = k//2
-        self.proj = nn.Conv2d(dim, dim, kernel_size=k, padding=padding, groups=dim, bias=True)
-    def forward(self, x):  # x: [B,C,H,W]
+        self.proj = nn.Conv2d(dim, dim, kernel_size=k, padding=k // 2, groups=dim, bias=True)
+
+    def forward(self, x):
         return x + self.proj(x)
 
-class CrossTemporalFusion(nn.Module):
-    """
-    Multi-scale feature differencing fusion:
-    concat(F1, F2, |F2-F1|, F2-F1) -> 1x1 conv reduce -> 3x3 conv refine.
-    Output channels match input feature channels (C).
-    """
-    def __init__(self, channels: int):
-        super().__init__()
-        in_ch = channels * 4  # concat 4 feature maps
-        self.fuse = nn.Sequential(
-            nn.Conv2d(in_ch, channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, f1: torch.Tensor, f2: torch.Tensor) -> torch.Tensor:
-        """Fuse T1 and T2 features at a given scale."""
-        diff = f2 - f1
-        adiff = torch.abs(diff)
-        x = torch.cat([f1, f2, adiff, diff], dim=1)
-        return self.fuse(x)
-
-class JointFeatureLearning(nn.Module):
-    """
-    Bidirectional feature learning: change features influence semantic features during encoding.
-    This replaces post-hoc fusion with joint learning.
-    """
-    def __init__(self, channels: int):
-        super().__init__()
-        # Change-to-semantic influence
-        self.change_to_sem = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.Sigmoid()  # Gate mechanism
-        )
-        # Semantic-to-change influence
-        self.sem_to_change = nn.Sequential(
-            nn.Conv2d(channels * 2, channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True)
-        )
-        # Refine change features
-        self.refine_change = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True)
-        )
-        
-    def forward(self, f1: torch.Tensor, f2: torch.Tensor, change_feat: torch.Tensor):
-        """
-        Args:
-            f1, f2: Semantic features from T1, T2 [B, C, H, W]
-            change_feat: Initial change features [B, C, H, W]
-        Returns:
-            f1_enhanced, f2_enhanced, change_enhanced
-        """
-        # Change features modulate semantic features (multiplicative gating)
-        change_gate = self.change_to_sem(change_feat)
-        f1_enhanced = f1 * (1.0 + change_gate)
-        f2_enhanced = f2 * (1.0 + change_gate)
-        
-        # Semantic features enhance change features (additive)
-        sem_avg = (f1_enhanced + f2_enhanced) / 2.0
-        change_context = self.sem_to_change(torch.cat([sem_avg, change_feat], dim=1))
-        change_enhanced = self.refine_change(change_feat + change_context)
-        
-        return f1_enhanced, f2_enhanced, change_enhanced
-
-class MultiScaleInteractionBlock(nn.Module):
-    """
-    Memory-efficient multi-scale semantic-change interaction.
-    Uses channel attention instead of spatial attention to avoid OOM on high-resolution features.
-    """
-    def __init__(self, channels: int):
-        super().__init__()
-        self.channels = channels
-        
-        # Channel attention: semantic ↔ change interaction
-        # Much more memory efficient: [B, C, C] instead of [B, HW, HW]
-        self.sem_to_chg = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),  # [B, C, 1, 1]
-            nn.Conv2d(channels, channels // 4, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels // 4, channels, 1),
-            nn.Sigmoid()
-        )
-        
-        self.chg_to_sem = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels, channels // 4, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels // 4, channels, 1),
-            nn.Sigmoid()
-        )
-        
-        self.norm_sem = nn.BatchNorm2d(channels)
-        self.norm_chg = nn.BatchNorm2d(channels)
-        
-        # Lightweight spatial refinement with depthwise separable convs
-        self.refine_sem = nn.Sequential(
-            nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.Conv2d(channels, channels, 1, bias=False),
-            nn.ReLU(inplace=True)
-        )
-        self.refine_chg = nn.Sequential(
-            nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.Conv2d(channels, channels, 1, bias=False),
-            nn.ReLU(inplace=True)
-        )
-        
-    def forward(self, sem_t1: torch.Tensor, sem_t2: torch.Tensor, change_feat: torch.Tensor):
-        """
-        Args:
-            sem_t1, sem_t2: [B, C, H, W]
-            change_feat: [B, C, H, W]
-        Returns:
-            Enhanced (sem_t1, sem_t2, change_feat)
-        """
-        B, C, H, W = sem_t1.shape
-        sem_avg = (sem_t1 + sem_t2) / 2.0
-        
-        # Channel attention: change features modulate semantic channels
-        chg_attention = self.chg_to_sem(change_feat)  # [B, C, 1, 1]
-        sem_modulated = sem_avg * chg_attention  # [B, C, H, W]
-        
-        # Channel attention: semantic features modulate change channels
-        sem_attention = self.sem_to_chg(sem_avg)  # [B, C, 1, 1]
-        chg_modulated = change_feat * sem_attention  # [B, C, H, W]
-        
-        # Residual + refinement
-        sem_out = self.refine_sem(self.norm_sem(sem_avg + sem_modulated))
-        chg_out = self.refine_chg(self.norm_chg(change_feat + chg_modulated))
-        
-        # Apply to both T1 and T2
-        sem_t1_out = sem_t1 + sem_out
-        sem_t2_out = sem_t2 + sem_out
-        change_out = change_feat + chg_out
-        
-        return sem_t1_out, sem_t2_out, change_out
-
-class SemanticChangeInteractionBlock(nn.Module):
-    """
-    Lightweight semantic-change interaction at bottleneck.
-    Uses cross-attention between semantic tokens (T1, T2) and change tokens (fused).
-    Minimal compute: single attention block with efficient implementation.
-    """
-    def __init__(self, channels: int, num_heads: int = 4, use_mamba: bool = False):
-        super().__init__()
-        self.channels = channels
-        self.num_heads = num_heads
-        self.use_mamba = use_mamba
-        
-        # Layer norms
-        self.norm_sem = nn.LayerNorm(channels)
-        self.norm_chg = nn.LayerNorm(channels)
-        
-        if use_mamba:
-            # Mamba-style mixing (lightweight alternative to attention)
-            self.sem_to_chg = ConvMamba(d_model=channels, d_state=16, d_conv=4, expand=2, bimamba_type="v2")
-            self.chg_to_sem = ConvMamba(d_model=channels, d_state=16, d_conv=4, expand=2, bimamba_type="v2")
-        else:
-            # Cross-attention: semantic attends to change, change attends to semantic
-            self.sem_to_chg_attn = nn.MultiheadAttention(channels, num_heads, batch_first=True)
-            self.chg_to_sem_attn = nn.MultiheadAttention(channels, num_heads, batch_first=True)
-        
-        # FFN for refinement
-        self.ffn_sem = nn.Sequential(
-            nn.Linear(channels, channels * 2),
-            nn.GELU(),
-            nn.Linear(channels * 2, channels),
-        )
-        self.ffn_chg = nn.Sequential(
-            nn.Linear(channels, channels * 2),
-            nn.GELU(),
-            nn.Linear(channels * 2, channels),
-        )
-        
-        self.norm_ffn_sem = nn.LayerNorm(channels)
-        self.norm_ffn_chg = nn.LayerNorm(channels)
-    
-    def forward(self, sem_t1: torch.Tensor, sem_t2: torch.Tensor, change_fused: torch.Tensor):
-        """
-        Args:
-            sem_t1: [B, C, H, W] - T1 semantic features
-            sem_t2: [B, C, H, W] - T2 semantic features
-            change_fused: [B, C, H, W] - fused change features
-        Returns:
-            Enhanced (sem_t1, sem_t2, change_fused)
-        """
-        B, C, H, W = sem_t1.shape
-        
-        # Flatten to tokens: [B, C, H, W] -> [B, H*W, C]
-        sem_t1_flat = sem_t1.flatten(2).transpose(1, 2)  # [B, HW, C]
-        sem_t2_flat = sem_t2.flatten(2).transpose(1, 2)
-        chg_flat = change_fused.flatten(2).transpose(1, 2)
-        
-        # Average semantic tokens from T1 and T2
-        sem_avg = (sem_t1_flat + sem_t2_flat) / 2.0  # [B, HW, C]
-        
-        # Normalize
-        sem_norm = self.norm_sem(sem_avg)
-        chg_norm = self.norm_chg(chg_flat)
-        
-        if self.use_mamba:
-            # Mamba-style mixing (reshape needed for ConvMamba)
-            sem_norm_2d = sem_norm.transpose(1, 2).reshape(B, C, H, W)
-            chg_norm_2d = chg_norm.transpose(1, 2).reshape(B, C, H, W)
-            
-            # Mix: semantic informed by change
-            sem_enhanced_2d = sem_norm_2d + self.chg_to_sem(chg_norm_2d)
-            # Mix: change informed by semantic
-            chg_enhanced_2d = chg_norm_2d + self.sem_to_chg(sem_norm_2d)
-            
-            sem_enhanced = sem_enhanced_2d.flatten(2).transpose(1, 2)
-            chg_enhanced = chg_enhanced_2d.flatten(2).transpose(1, 2)
-        else:
-            # Cross-attention: semantic queries change context
-            sem_enhanced, _ = self.sem_to_chg_attn(
-                query=sem_norm, key=chg_norm, value=chg_norm
-            )
-            sem_enhanced = sem_avg + sem_enhanced  # Residual
-            
-            # Cross-attention: change queries semantic context
-            chg_enhanced, _ = self.chg_to_sem_attn(
-                query=chg_norm, key=sem_norm, value=sem_norm
-            )
-            chg_enhanced = chg_flat + chg_enhanced  # Residual
-        
-        # FFN refinement
-        sem_enhanced = sem_enhanced + self.ffn_sem(self.norm_ffn_sem(sem_enhanced))
-        chg_enhanced = chg_enhanced + self.ffn_chg(self.norm_ffn_chg(chg_enhanced))
-        
-        # Reshape back to feature maps: [B, HW, C] -> [B, C, H, W]
-        sem_enhanced = sem_enhanced.transpose(1, 2).reshape(B, C, H, W)
-        chg_enhanced = chg_enhanced.transpose(1, 2).reshape(B, C, H, W)
-        
-        # Apply enhancement to both T1 and T2 semantic features
-        sem_t1_out = sem_t1 + sem_enhanced
-        sem_t2_out = sem_t2 + sem_enhanced
-        change_out = change_fused + chg_enhanced
-        
-        return sem_t1_out, sem_t2_out, change_out
 
 class ModifiedSRCMLayer(nn.Module):
+    """
+    Core Mamba token-mixer for 2-D feature maps.
+
+    Pipeline:
+      1. Depthwise-conv positional encoding
+      2. Flatten H×W → token sequence, add learned 2-D position embeddings
+      3. Grouped bi-directional Mamba (each of G groups processes C/G channels)
+      4. Gated residual: sigmoid(gate) * mamba_out + (1-gate) * input
+      5. Linear projection to output_dim
+
+    Input: [B, input_dim, H, W]   Output: [B, output_dim, H, W]
+    """
     def __init__(self, input_dim, output_dim, d_state=16, d_conv=4, expand=2, groups=4):
         super().__init__()
-        self.input_dim = input_dim
+        self.input_dim  = input_dim
         self.output_dim = output_dim
-        self.groups = groups
-        self.norm = nn.LayerNorm(input_dim)
-
-        # Grouped ConvMamba (split channels across groups)
-        self.mambas = nn.ModuleList([
-            ConvMamba(d_model=input_dim // groups, d_state=d_state, d_conv=d_conv, expand=expand, bimamba_type="v2")
+        self.groups     = groups
+        self.norm       = nn.LayerNorm(input_dim)
+        self.mambas     = nn.ModuleList([
+            ConvMamba(d_model=input_dim // groups, d_state=d_state, d_conv=d_conv,
+                      expand=expand, bimamba_type="v2")
             for _ in range(groups)
         ])
-
         self.gate_proj = nn.Linear(input_dim, input_dim)
-        self.pos_enc = ConvPosEnc(input_dim)
-        self.pos_embed = nn.Parameter(torch.randn(1, 4096, input_dim))  # Max 64x64 tokens (safe default)
-        self.proj = nn.Linear(input_dim, output_dim)
+        self.pos_enc   = ConvPosEnc(input_dim)
+        self.pos_embed = nn.Parameter(torch.randn(1, 4096, input_dim))  # max 64×64 tokens
+        self.proj      = nn.Linear(input_dim, output_dim)
 
     def forward(self, x):
         B, C, H, W = x.shape
         x = self.pos_enc(x)
-        x = x.reshape(B, C, -1).transpose(1, 2)  
-        pos_embed = F.interpolate(
-            self.pos_embed.transpose(1, 2).reshape(1, self.input_dim, int(self.pos_embed.shape[1] ** 0.5), -1),
-            size=(H, W),
-            mode='bilinear',
-            align_corners=False
-        ).reshape(1, self.input_dim, -1).transpose(1, 2)  # Shape: [1, H*W, C]
-        x = x + pos_embed[:, :x.shape[1], :]
+        x = x.reshape(B, C, -1).transpose(1, 2)                          # [B, HW, C]
 
-        x_norm = self.norm(x)
+        pos = F.interpolate(
+            self.pos_embed.transpose(1, 2).reshape(
+                1, self.input_dim, int(self.pos_embed.shape[1] ** 0.5), -1),
+            size=(H, W), mode='bilinear', align_corners=False,
+        ).reshape(1, self.input_dim, -1).transpose(1, 2)                  # [1, HW, C]
+        x = x + pos[:, :x.shape[1], :]
 
-        # Grouped Mamba
-        chunks = x_norm.chunk(self.groups, dim=-1)
-        out_chunks = [m(chunk) for m, chunk in zip(self.mambas, chunks)]
-        x_mamba = torch.cat(out_chunks, dim=-1)
+        x_norm  = self.norm(x)
+        chunks  = x_norm.chunk(self.groups, dim=-1)
+        x_mamba = torch.cat([m(c) for m, c in zip(self.mambas, chunks)], dim=-1)
 
-        # Gated residual
-        gate = torch.sigmoid(self.gate_proj(x_norm))
+        gate  = torch.sigmoid(self.gate_proj(x_norm))
         x_out = gate * x_mamba + (1 - gate) * x
+        return self.proj(x_out).transpose(1, 2).reshape(B, self.output_dim, H, W)
 
-        x_out = self.proj(x_out)
-        return x_out.transpose(1, 2).reshape(B, self.output_dim, H, W)
 
-def get_srcm_layer(
-        spatial_dims: int, in_channels: int, out_channels: int, stride: int = 1, conv_mode: str = "deepwise"
-):
-    srcm_layer = ModifiedSRCMLayer(input_dim=in_channels, output_dim=out_channels)  # Removed conv_mode
-    if stride != 1:
-        if spatial_dims == 2:
-            return nn.Sequential(srcm_layer, nn.MaxPool2d(kernel_size=stride, stride=stride))
-    return srcm_layer
+def get_srcm_layer(spatial_dims, in_channels, out_channels, stride=1, conv_mode="deepwise"):
+    """Build a ModifiedSRCMLayer, optionally followed by MaxPool2d for stride-2 downsampling."""
+    layer = ModifiedSRCMLayer(input_dim=in_channels, output_dim=out_channels)
+    if stride != 1 and spatial_dims == 2:
+        return nn.Sequential(layer, nn.MaxPool2d(kernel_size=stride, stride=stride))
+    return layer
 
 
 class SRCMBlock(nn.Module):
+    """
+    Residual SRCM block (used in both encoder and decoder).
 
-    def __init__(
-            self,
-            spatial_dims: int,
-            in_channels: int,
-            norm: tuple | str,
-            kernel_size: int = 3,
-            conv_mode: str = "deepwise",
-            act: tuple | str = ("RELU", {"inplace": True}),
-    ) -> None:
-        """
-        Args:
-            spatial_dims: number of spatial dimensions, could be 1, 2 or 3.
-            in_channels: number of input channels.
-            norm: feature normalization type and arguments.
-            kernel_size: convolution kernel size, the value should be an odd number. Defaults to 3.
-            act: activation type and arguments. Defaults to ``RELU``.
-        """
+    Pre-norm → Act → SRCM → Pre-norm → Act → SRCM → Dropout → SE → residual
 
+    The learnable residual scale allows the block to adaptively suppress or
+    amplify its own contribution.
+
+    Input / output: [B, C, H, W]
+    """
+    def __init__(self, spatial_dims, in_channels, norm,
+                 act=("RELU", {"inplace": True}), kernel_size=3, conv_mode="deepwise"):
         super().__init__()
-
         if kernel_size % 2 != 1:
             raise AssertionError("kernel_size should be an odd number.")
-        # print(conv_mode)
-        self.norm1 = get_norm_layer(name=norm, spatial_dims=spatial_dims, channels=in_channels)
-        self.norm2 = get_norm_layer(name=norm, spatial_dims=spatial_dims, channels=in_channels)
-        self.act = get_act_layer(act)
-        self.conv1 = get_srcm_layer(
-            spatial_dims, in_channels=in_channels, out_channels=in_channels, conv_mode=conv_mode
-        )
-        self.conv2 = get_srcm_layer(
-            spatial_dims, in_channels=in_channels, out_channels=in_channels, conv_mode=conv_mode
-        )
-        self.res_scale = nn.Parameter(torch.tensor(1.0))  # residual scaling
-        self.drop = nn.Dropout2d(p=0.1) 
-        self.se = nn.Sequential(
+        self.norm1     = get_norm_layer(name=norm, spatial_dims=spatial_dims, channels=in_channels)
+        self.norm2     = get_norm_layer(name=norm, spatial_dims=spatial_dims, channels=in_channels)
+        self.act       = get_act_layer(act)
+        self.conv1     = get_srcm_layer(spatial_dims, in_channels, in_channels, conv_mode=conv_mode)
+        self.conv2     = get_srcm_layer(spatial_dims, in_channels, in_channels, conv_mode=conv_mode)
+        self.res_scale = nn.Parameter(torch.tensor(1.0))
+        self.drop      = nn.Dropout2d(p=0.1)
+        self.se        = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(in_channels, in_channels//8, 1), nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels//8, in_channels, 1), nn.Sigmoid()
+            nn.Conv2d(in_channels, in_channels // 8, 1), nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels // 8, in_channels, 1), nn.Sigmoid(),
         )
 
     def forward(self, x):
         identity = x
-        x = self.act(self.norm1(x))
-        x = self.conv1(x)
-        x = self.act(self.norm2(x))
-        x = self.conv2(x)
-        x = self.drop(x)
-        x = x * self.se(x)
+        x = self.conv1(self.act(self.norm1(x)))
+        x = self.conv2(self.act(self.norm2(x)))
+        x = self.drop(x) * self.se(x)
         return identity + self.res_scale * x
 
-class CDMamba_seg_cd(nn.Module):
-    """
-    Segmentation and Change Detection Mamba-based Model.
-    - Outputs segmentation for T1, T2, and change map.
-    - num_classes: number of semantic classes.
-    - If use_change_head=True, outputs per-pixel change logits.
-    """
 
-    def __init__(
-            self,
-            spatial_dims: int = 3,
-            init_filters: int = 16,
-            in_channels: int = 1,
-            num_classes: int = 7,
-            use_change_head: bool = True,  # <-- NEW: output change map
-            conv_mode: str = "deepwise",
-            dropout_prob: float | None = None,
-            act: tuple | str = ("RELU", {"inplace": True}),
-            norm: tuple | str = ("GROUP", {"num_groups": 8}),
-            norm_name: str = "",
-            num_groups: int = 8,
-            blocks_down: tuple = (1, 2, 2, 4),
-            blocks_up: tuple = (1, 1, 1),
-            up_conv_mode: str = "deepwise",
-            upsample_mode: UpsampleMode | str = UpsampleMode.NONTRAINABLE,
-            use_change_gating: bool = True,
-            change_gate_alpha: float = 1.0,
-            change_gate_beta: float = 0.2,
-            change_gate_mode: str = "additive",
-            use_interaction_block: bool = True,
-            interaction_num_heads: int = 4,
-            interaction_use_mamba: bool = False,
-    ):
+# ---------------------------------------------------------------------------
+# Encoder and Decoder
+# ---------------------------------------------------------------------------
+
+class SRCMEncoder(nn.Module):
+    """
+    Hierarchical feature encoder.
+
+    Stage i produces features at 1/2^max(0,i) of the input resolution with
+    init_filters * 2^i channels. Stage 0 has no downsampling; stages 1+ start
+    with a stride-2 SRCM layer followed by n SRCMBlocks.
+
+    forward(x) → (latent, all_skips)
+        latent    : deepest feature map  [B, C_deep, H/8, W/8]
+        all_skips : [scale_0, ..., scale_N]  ordered shallow → deep
+                    (latent == all_skips[-1])
+    """
+    def __init__(self, spatial_dims, in_channels, init_filters, blocks_down,
+                 norm, act, conv_mode, dropout_prob=None):
         super().__init__()
-        self.num_classes = num_classes
-        self.use_change_head = use_change_head
-        self.use_change_gating = use_change_gating
-        self.change_gate_alpha = change_gate_alpha
-        self.change_gate_beta = change_gate_beta
-        self.change_gate_mode = change_gate_mode  # "additive" or "multiplicative"
-        self.use_interaction_block = use_interaction_block
-
-        if spatial_dims not in (2, 3):
-            raise ValueError("`spatial_dims` can only be 2 or 3.")
-        self.up_conv_mode = up_conv_mode
-        self.conv_mode = conv_mode
-        self.spatial_dims = spatial_dims
-        self.init_filters = init_filters
-        self.in_channels = in_channels
-        self.blocks_down = blocks_down
-        self.blocks_up = blocks_up
         self.dropout_prob = dropout_prob
-        self.act = act  # input options
-        self.act_mod = get_act_layer(act)
-        if norm_name:
-            if norm_name.lower() != "group":
-                raise ValueError(f"Deprecating option 'norm_name={norm_name}', please use 'norm' instead.")
-            norm = ("group", {"num_groups": num_groups})
-        self.norm = norm
-        self.upsample_mode = UpsampleMode(upsample_mode)
-        self.convInit = get_conv_layer(spatial_dims, in_channels, init_filters)
-        self.srcm_encoder_layers = self._make_srcm_encoder_layers()
-        self.srcm_decoder_layers, self.up_samples = self._make_srcm_decoder_layers()
-        self.srcm_decoder_layers_seg_t1, self.up_samples_seg_t1 = self._make_srcm_decoder_layers()
-        self.srcm_decoder_layers_seg_t2, self.up_samples_seg_t2 = self._make_srcm_decoder_layers()
-        # Dedicated change decoder operating on fused multi-scale features
-        self.srcm_decoder_layers_change, self.up_samples_change = self._make_srcm_decoder_layers()
-
-        # ---- Bottleneck context (ASPP-lite / dilated conv stack) ----
-        bottleneck_channels = init_filters * (2 ** (len(blocks_down) - 1))  # e.g., 16 * 2**3 = 128 with your defaults
- 
-        if self.spatial_dims == 2:
-            norm_fn = lambda c: get_norm_layer(name=self.norm, spatial_dims=2, channels=c)
-            self.context = ContextBlock2D(bottleneck_channels, norm_fn, self.act_mod)
-        else:
-            self.context = nn.Identity()  # or implement ContextBlock3D
-
-        # Cross-temporal fusion modules: one per encoder scale
-        # Encoder produces channels: init_filters * 2**i for i in [0..len(blocks_down)-1]
-        self.fuse_scales = nn.ModuleList([
-            CrossTemporalFusion(init_filters * (2 ** i)) for i in range(len(blocks_down))
-        ])
-        # Fusion at bottleneck level
-        self.fuse_bottleneck = CrossTemporalFusion(bottleneck_channels)
-        
-        # Joint feature learning modules at each scale (bidirectional influence)
-        self.joint_learning_scales = nn.ModuleList([
-            JointFeatureLearning(init_filters * (2 ** i)) for i in range(len(blocks_down))
-        ])
-        self.joint_learning_bottleneck = JointFeatureLearning(bottleneck_channels)
-        
-        # Multi-scale interaction blocks at each encoder level
-        if self.use_interaction_block:
-            self.interaction_blocks = nn.ModuleList([
-                MultiScaleInteractionBlock(init_filters * (2 ** i)) for i in range(len(blocks_down))
-            ])
-            # Bottleneck interaction (more powerful)
-            self.interaction_block_bottleneck = SemanticChangeInteractionBlock(
-                channels=bottleneck_channels,
-                num_heads=interaction_num_heads,
-                use_mamba=interaction_use_mamba
-            )
-        
-        # Skip connection alignment modules
-        # These create aligned skip connections for all three paths from fused features
-        self.skip_align_t1 = nn.ModuleList([
-            nn.Conv2d(init_filters * (2 ** i), init_filters * (2 ** i), 1, bias=False)
-            for i in range(len(blocks_down))
-        ])
-        self.skip_align_t2 = nn.ModuleList([
-            nn.Conv2d(init_filters * (2 ** i), init_filters * (2 ** i), 1, bias=False)
-            for i in range(len(blocks_down))
-        ])
-        self.skip_align_change = nn.ModuleList([
-            nn.Conv2d(init_filters * (2 ** i), init_filters * (2 ** i), 1, bias=False)
-            for i in range(len(blocks_down))
-        ])
-
-        # --- SEGMENTATION HEADS ---
-        # Each head outputs num_classes channels
-        self.seg_head_t1 = nn.Sequential(
-            get_norm_layer(name=self.norm, spatial_dims=self.spatial_dims, channels=self.init_filters),
-            self.act_mod,
-            get_conv_layer(self.spatial_dims, self.init_filters, self.num_classes, kernel_size=1, bias=True),
-        )
-        self.seg_head_t2 = nn.Sequential(
-            get_norm_layer(name=self.norm, spatial_dims=self.spatial_dims, channels=self.init_filters),
-            self.act_mod,
-            get_conv_layer(self.spatial_dims, self.init_filters, self.num_classes, kernel_size=1, bias=True),
-        )
-        
-        if self.use_change_head:
-            # Output 1 channel: change probability logit (sigmoid-based)
-            # Using a single channel is consistent with BCE+Dice training and avoids
-            # the softmax-vs-sigmoid mismatch that caused the 2-channel design to fail.
-            self.change_head = nn.Sequential(
-                get_norm_layer(name=self.norm, spatial_dims=self.spatial_dims, channels=self.init_filters),
-                self.act_mod,
-                get_conv_layer(self.spatial_dims, self.init_filters, 1, kernel_size=1, bias=True),
-            )
-
+        self.conv_init    = get_conv_layer(spatial_dims, in_channels, init_filters)
         if dropout_prob is not None:
             self.dropout = Dropout[Dropout.DROPOUT, spatial_dims](dropout_prob)
 
-    def _make_srcm_encoder_layers(self):
-        srcm_encoder_layers = nn.ModuleList()
-        blocks_down, spatial_dims, filters, norm, conv_mode = (self.blocks_down, self.spatial_dims, self.init_filters, self.norm, self.conv_mode)
-        for i, item in enumerate(blocks_down):
-            layer_in_channels = filters * 2 ** i
-            downsample_mamba = (
-                get_srcm_layer(spatial_dims, layer_in_channels // 2, layer_in_channels, stride=2, conv_mode=conv_mode)
-                if i > 0
-                else nn.Identity()
+        stages = []
+        for i, n_blocks in enumerate(blocks_down):
+            ch         = init_filters * 2 ** i
+            downsample = (
+                get_srcm_layer(spatial_dims, ch // 2, ch, stride=2, conv_mode=conv_mode)
+                if i > 0 else nn.Identity()
             )
-            down_layer = nn.Sequential(
-                downsample_mamba,
-                *[SRCMBlock(spatial_dims, layer_in_channels, norm=norm, act=self.act, conv_mode=conv_mode) for _ in range(item)]
-            )
-            srcm_encoder_layers.append(down_layer)
-        return srcm_encoder_layers
+            stages.append(nn.Sequential(
+                downsample,
+                *[SRCMBlock(spatial_dims, ch, norm=norm, act=act, conv_mode=conv_mode)
+                  for _ in range(n_blocks)],
+            ))
+        self.stages = nn.ModuleList(stages)
 
-    def _make_srcm_decoder_layers(self):
-        srcm_decoder_layers, up_samples = nn.ModuleList(), nn.ModuleList()
-        upsample_mode, blocks_up, spatial_dims, filters, norm = (
-            self.upsample_mode,
-            self.blocks_up,
-            self.spatial_dims,
-            self.init_filters,
-            self.norm,
-        )
-        Block_up = SRCMBlock
-        n_up = len(blocks_up)
-        # in _make_srcm_decoder_layers():
-        for i in range(n_up):
-            sample_in_channels = filters * 2 ** (n_up - i)          # e.g., 128, 64, 32 at the start
-            cat_channels = (sample_in_channels // 2) * 2            # concat of up and skip
-            srcm_decoder_layers.append(
-                nn.Sequential(
-                    get_conv_layer(spatial_dims, cat_channels, sample_in_channels // 2, kernel_size=3, stride=1),
-                    Block_up(spatial_dims, sample_in_channels // 2, norm=norm, act=self.act, conv_mode=self.up_conv_mode)
-                )
-            )
-            up_samples.append(
-                nn.Sequential(
-                    get_conv_layer(spatial_dims, sample_in_channels, sample_in_channels // 2, kernel_size=1),
-                    get_upsample_layer(spatial_dims, sample_in_channels // 2, upsample_mode=upsample_mode),
-                )
-            )
-
-        return srcm_decoder_layers, up_samples
-
-    # removed _make_final_conv (not used in segmentation-only)
-
-    def encode(self, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        x = self.convInit(x)
+    def forward(self, x):
+        x = self.conv_init(x)
         if self.dropout_prob is not None:
             x = self.dropout(x)
-        down_x = []
+        skips = []
+        for stage in self.stages:
+            x = stage(x)
+            skips.append(x)
+        return x, skips   # latent == skips[-1]
 
-        for down in self.srcm_encoder_layers:
-            x = down(x)
-            down_x.append(x)
 
-        return x, down_x
+class SRCMDecoder(nn.Module):
+    """
+    Hierarchical feature decoder.
 
-    def _decode_with_layers(
-        self,
-        x: torch.Tensor,
-        down_x: list[torch.Tensor],
-        up_samples: nn.ModuleList,
-        decoder_layers: nn.ModuleList,
-    ) -> torch.Tensor:
+    At each step: upsample → spatially align if needed → concat skip → refine.
+
+    forward(latent, skips_deep_to_shallow) → feature map at full encoder resolution
+
+    skips_deep_to_shallow: encoder skips ordered deep → shallow, excluding the
+                           bottleneck (deepest) scale which is the latent itself.
+    """
+    def __init__(self, spatial_dims, init_filters, blocks_up, norm, act,
+                 up_conv_mode, upsample_mode):
+        super().__init__()
+        self.spatial_dims = spatial_dims
+        n_up = len(blocks_up)
+
+        up_samples, layers = [], []
+        for i in range(n_up):
+            in_ch  = init_filters * 2 ** (n_up - i)   # e.g. 128 → 64 → 32
+            out_ch = in_ch // 2                        # e.g.  64 → 32 → 16
+            up_samples.append(nn.Sequential(
+                get_conv_layer(spatial_dims, in_ch, out_ch, kernel_size=1),
+                get_upsample_layer(spatial_dims, out_ch, upsample_mode=upsample_mode),
+            ))
+            layers.append(nn.Sequential(
+                get_conv_layer(spatial_dims, out_ch * 2, out_ch, kernel_size=3, stride=1),
+                SRCMBlock(spatial_dims, out_ch, norm=norm, act=act, conv_mode=up_conv_mode),
+            ))
+        self.up_samples = nn.ModuleList(up_samples)
+        self.layers     = nn.ModuleList(layers)
+
+    def forward(self, x, skips):
         """
-        down_x is expected to be reversed before calling this:
-        down_x[0] = bottleneck feature (same scale as x)
-        down_x[1:] = skip features from deep -> shallow
+        x    : [B, C_deep, H_deep, W_deep]
+        skips: encoder skip features ordered deep → shallow, len == n_up
         """
-        skips = down_x[1:]  # exclude bottleneck
-
-        interp_mode = "bilinear" if self.spatial_dims == 2 else "trilinear"
-
-        for i, (up, upl) in enumerate(zip(up_samples, decoder_layers)):
-            x_up = up(x)
-            target = skips[i]
-
-            if x_up.shape[2:] != target.shape[2:]:
-                x_up = F.interpolate(
-                    x_up, size=target.shape[2:], mode=interp_mode, align_corners=False
-                )
-
-            x = torch.cat([x_up, target], dim=1)
-            x = upl(x)
-
+        interp = "bilinear" if self.spatial_dims == 2 else "trilinear"
+        for up, layer, skip in zip(self.up_samples, self.layers, skips):
+            x = up(x)
+            if x.shape[2:] != skip.shape[2:]:
+                x = F.interpolate(x, size=skip.shape[2:], mode=interp, align_corners=False)
+            x = layer(torch.cat([x, skip], dim=1))
         return x
 
 
+# ---------------------------------------------------------------------------
+# Cross-temporal fusion modules
+# ---------------------------------------------------------------------------
 
-    def decode(self, x: torch.Tensor, down_x: list[torch.Tensor]) -> torch.Tensor:
-        return self._decode_with_layers(x, down_x, self.up_samples, self.srcm_decoder_layers)
+class CrossTemporalFusion(nn.Module):
+    """
+    Multi-cue differencing fusion at one encoder scale.
 
+    Concatenates [F1, F2, |F2-F1|, F2-F1] (4C channels) and reduces back to C
+    via a 1×1 conv (channel reduction) followed by a 3×3 conv (spatial refinement).
+
+    Input : two feature maps F1, F2  each [B, C, H, W]
+    Output: fused change features         [B, C, H, W]
+    """
+    def __init__(self, channels):
+        super().__init__()
+        self.fuse = nn.Sequential(
+            nn.Conv2d(channels * 4, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels), nn.ReLU(inplace=True),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels), nn.ReLU(inplace=True),
+        )
+
+    def forward(self, f1, f2):
+        diff = f2 - f1
+        return self.fuse(torch.cat([f1, f2, diff.abs(), diff], dim=1))
+
+
+class JointFeatureLearning(nn.Module):
+    """
+    Bidirectional coupling between semantic (T1/T2) and change features.
+
+    Step 1 — change → semantic:
+        A sigmoid gate derived from change features multiplicatively modulates
+        both T1 and T2 semantic features.
+
+    Step 2 — semantic → change:
+        The averaged (and already modulated) semantic features provide additive
+        context that is refined and added back to the change features.
+
+    All inputs / outputs: [B, C, H, W]
+    """
+    def __init__(self, channels):
+        super().__init__()
+        self.change_to_sem_gate = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels), nn.Sigmoid(),
+        )
+        self.sem_to_change_ctx = nn.Sequential(
+            nn.Conv2d(channels * 2, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels), nn.ReLU(inplace=True),
+        )
+        self.refine_change = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels), nn.ReLU(inplace=True),
+        )
+
+    def forward(self, f1, f2, change_feat):
+        # Change gates semantic (multiplicative)
+        gate   = self.change_to_sem_gate(change_feat)
+        f1_enh = f1 * (1.0 + gate)
+        f2_enh = f2 * (1.0 + gate)
+        # Semantic enriches change (additive)
+        sem_avg    = (f1_enh + f2_enh) / 2.0
+        ctx        = self.sem_to_change_ctx(torch.cat([sem_avg, change_feat], dim=1))
+        change_enh = self.refine_change(change_feat + ctx)
+        return f1_enh, f2_enh, change_enh
+
+
+class MultiScaleInteractionBlock(nn.Module):
+    """
+    Channel-attention interaction between semantic and change features.
+
+    Avoids O(HW²) spatial attention by squeezing to per-channel descriptors first.
+    Each path modulates the other via a squeeze-and-excitation network, then a
+    depthwise-separable conv refines the result spatially.
+
+    All inputs / outputs: [B, C, H, W]
+    """
+    def __init__(self, channels):
+        super().__init__()
+        def _se():
+            return nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Conv2d(channels, channels // 4, 1), nn.ReLU(inplace=True),
+                nn.Conv2d(channels // 4, channels, 1), nn.Sigmoid(),
+            )
+        def _dw_refine():
+            return nn.Sequential(
+                nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=False),
+                nn.BatchNorm2d(channels),
+                nn.Conv2d(channels, channels, 1, bias=False), nn.ReLU(inplace=True),
+            )
+        # change features produce a gate for semantic channels, and vice-versa
+        self.chg_to_sem_gate = _se()
+        self.sem_to_chg_gate = _se()
+        self.norm_sem        = nn.BatchNorm2d(channels)
+        self.norm_chg        = nn.BatchNorm2d(channels)
+        self.refine_sem      = _dw_refine()
+        self.refine_chg      = _dw_refine()
+
+    def forward(self, sem_t1, sem_t2, change_feat):
+        sem_avg = (sem_t1 + sem_t2) / 2.0
+
+        sem_modulated  = sem_avg     * self.chg_to_sem_gate(change_feat)   # change gates semantic
+        chg_modulated  = change_feat * self.sem_to_chg_gate(sem_avg)       # semantic gates change
+
+        sem_out = self.refine_sem(self.norm_sem(sem_avg     + sem_modulated))
+        chg_out = self.refine_chg(self.norm_chg(change_feat + chg_modulated))
+
+        return sem_t1 + sem_out, sem_t2 + sem_out, change_feat + chg_out
+
+
+class SemanticChangeInteractionBlock(nn.Module):
+    """
+    Bottleneck-level cross-attention (or Mamba) between semantic and change tokens.
+
+    Flattens the spatial dims into a token sequence, runs cross-attention in both
+    directions (semantic ↔ change), applies a small FFN, then reshapes back.
+    Used only at the deepest (smallest H×W) scale to keep compute tractable.
+
+    All inputs / outputs: [B, C, H, W]
+    """
+    def __init__(self, channels, num_heads=4, use_mamba=False):
+        super().__init__()
+        self.channels  = channels
+        self.use_mamba = use_mamba
+
+        self.norm_sem = nn.LayerNorm(channels)
+        self.norm_chg = nn.LayerNorm(channels)
+
+        if use_mamba:
+            # Lightweight Mamba-style cross-mixing (alternative to attention)
+            self.chg_to_sem = ConvMamba(d_model=channels, d_state=16, d_conv=4,
+                                        expand=2, bimamba_type="v2")
+            self.sem_to_chg = ConvMamba(d_model=channels, d_state=16, d_conv=4,
+                                        expand=2, bimamba_type="v2")
+        else:
+            # Cross-attention: semantic queries change context, and vice-versa
+            self.sem_attn = nn.MultiheadAttention(channels, num_heads, batch_first=True)
+            self.chg_attn = nn.MultiheadAttention(channels, num_heads, batch_first=True)
+
+        self.ffn_sem      = nn.Sequential(
+            nn.Linear(channels, channels * 2), nn.GELU(), nn.Linear(channels * 2, channels),
+        )
+        self.ffn_chg      = nn.Sequential(
+            nn.Linear(channels, channels * 2), nn.GELU(), nn.Linear(channels * 2, channels),
+        )
+        self.norm_ffn_sem = nn.LayerNorm(channels)
+        self.norm_ffn_chg = nn.LayerNorm(channels)
+
+    def forward(self, sem_t1, sem_t2, change_fused):
+        B, C, H, W = sem_t1.shape
+
+        # [B, C, H, W] → [B, HW, C]
+        sem_avg = (sem_t1.flatten(2).transpose(1, 2) +
+                   sem_t2.flatten(2).transpose(1, 2)) / 2.0
+        chg     = change_fused.flatten(2).transpose(1, 2)
+
+        sem_n = self.norm_sem(sem_avg)
+        chg_n = self.norm_chg(chg)
+
+        if self.use_mamba:
+            def _2d(tok): return tok.transpose(1, 2).reshape(B, C, H, W)
+            def _tok(feat): return feat.flatten(2).transpose(1, 2)
+            sem_enh = sem_n + _tok(self.chg_to_sem(_2d(chg_n)))
+            chg_enh = chg_n + _tok(self.sem_to_chg(_2d(sem_n)))
+        else:
+            sem_enh, _ = self.sem_attn(query=sem_n, key=chg_n, value=chg_n)
+            sem_enh     = sem_avg + sem_enh                  # residual
+            chg_enh, _ = self.chg_attn(query=chg_n, key=sem_n, value=sem_n)
+            chg_enh     = chg + chg_enh                      # residual
+
+        sem_enh = sem_enh + self.ffn_sem(self.norm_ffn_sem(sem_enh))
+        chg_enh = chg_enh + self.ffn_chg(self.norm_ffn_chg(chg_enh))
+
+        # [B, HW, C] → [B, C, H, W]
+        sem_out = sem_enh.transpose(1, 2).reshape(B, C, H, W)
+        chg_out = chg_enh.transpose(1, 2).reshape(B, C, H, W)
+
+        return sem_t1 + sem_out, sem_t2 + sem_out, change_fused + chg_out
+
+
+# ---------------------------------------------------------------------------
+# Main model
+# ---------------------------------------------------------------------------
+
+class CDMamba_seg_cd(nn.Module):
+    """
+    Joint Segmentation & Change Detection model based on Mamba.
+
+    Architecture overview (change-detection mode):
+
+        ┌──────────────────────────────────────────────────────┐
+        │  Shared encoder  (SRCMEncoder)                       │
+        │    T1 and T2 images encoded with the same weights    │
+        │                                                       │
+        │  Bottleneck context  (ContextBlock2D)                │
+        │    Applied independently to each temporal branch     │
+        │                                                       │
+        │  Per-scale fusion  (×N encoder stages)               │
+        │    CrossTemporalFusion  → concat + diff features     │
+        │    JointFeatureLearning → bidirectional sem↔change   │
+        │    MultiScaleInteraction→ channel-attention coupling  │
+        │                                                       │
+        │  Bottleneck fusion  (same three steps as above)      │
+        │    + SemanticChangeInteraction (cross-attention)      │
+        │                                                       │
+        │  Three independent decoders  (SRCMDecoder)           │
+        │    decoder_t1    → T1 segmentation                   │
+        │    decoder_t2    → T2 segmentation                   │
+        │    decoder_change→ binary change map                 │
+        │                                                       │
+        │  Change-guided gating  (optional)                    │
+        │    change_prob modulates seg decoder features         │
+        │                                                       │
+        │  Prediction heads                                     │
+        │    seg_head_t1, seg_head_t2 → [B, num_classes, H, W] │
+        │    change_head              → [B, 1, H, W]           │
+        └──────────────────────────────────────────────────────┘
+    """
+
+    def __init__(
+        self,
+        spatial_dims: int = 3,
+        init_filters: int = 16,
+        in_channels: int = 1,
+        num_classes: int = 7,
+        use_change_head: bool = True,
+        conv_mode: str = "deepwise",
+        dropout_prob: float | None = None,
+        act: tuple | str = ("RELU", {"inplace": True}),
+        norm: tuple | str = ("GROUP", {"num_groups": 8}),
+        norm_name: str = "",
+        num_groups: int = 8,
+        blocks_down: tuple = (1, 2, 2, 4),
+        blocks_up: tuple = (1, 1, 1),
+        up_conv_mode: str = "deepwise",
+        upsample_mode: UpsampleMode | str = UpsampleMode.NONTRAINABLE,
+        use_change_gating: bool = True,
+        change_gate_alpha: float = 1.0,
+        change_gate_beta: float = 0.2,
+        change_gate_mode: str = "additive",
+        use_interaction_block: bool = True,
+        interaction_num_heads: int = 4,
+        interaction_use_mamba: bool = False,
+    ):
+        super().__init__()
+
+        # ---- validate and resolve deprecated norm_name ----
+        if spatial_dims not in (2, 3):
+            raise ValueError("`spatial_dims` can only be 2 or 3.")
+        if norm_name:
+            if norm_name.lower() != "group":
+                raise ValueError(
+                    f"Deprecating option 'norm_name={norm_name}', please use 'norm' instead."
+                )
+            norm = ("group", {"num_groups": num_groups})
+
+        # ---- hyper-parameters needed at forward time ----
+        self.spatial_dims        = spatial_dims
+        self.num_classes         = num_classes
+        self.use_change_head     = use_change_head
+        self.use_change_gating   = use_change_gating
+        self.change_gate_alpha   = change_gate_alpha
+        self.change_gate_beta    = change_gate_beta
+        self.change_gate_mode    = change_gate_mode
+        self.use_interaction_block = use_interaction_block
+        # kept for inspection / checkpointing
+        self.init_filters        = init_filters
+        self.norm                = norm
+        self.act                 = act
+        self.upsample_mode       = UpsampleMode(upsample_mode)
+
+        act_mod       = get_act_layer(act)
+        bottleneck_ch = init_filters * (2 ** (len(blocks_down) - 1))
+        n_scales      = len(blocks_down)
+
+        # ---------------------------------------------------------------
+        # Shared encoder  (T1 and T2 share the same weights)
+        # ---------------------------------------------------------------
+        self.encoder = SRCMEncoder(
+            spatial_dims, in_channels, init_filters, blocks_down,
+            norm, act, conv_mode, dropout_prob,
+        )
+
+        # ---------------------------------------------------------------
+        # Bottleneck context  (applied independently to each branch)
+        # ---------------------------------------------------------------
+        if spatial_dims == 2:
+            norm_fn = lambda c: get_norm_layer(name=norm, spatial_dims=2, channels=c)
+            self.bottleneck = ContextBlock2D(bottleneck_ch, norm_fn, act_mod)
+        else:
+            self.bottleneck = nn.Identity()
+
+        # ---------------------------------------------------------------
+        # Per-scale cross-temporal fusion
+        # ---------------------------------------------------------------
+        self.fuse_scales = nn.ModuleList([
+            CrossTemporalFusion(init_filters * 2 ** i) for i in range(n_scales)
+        ])
+        self.fuse_bottleneck = CrossTemporalFusion(bottleneck_ch)
+
+        # ---------------------------------------------------------------
+        # Per-scale joint learning  (bidirectional sem ↔ change coupling)
+        # ---------------------------------------------------------------
+        self.joint_learning_scales = nn.ModuleList([
+            JointFeatureLearning(init_filters * 2 ** i) for i in range(n_scales)
+        ])
+        self.joint_learning_bottleneck = JointFeatureLearning(bottleneck_ch)
+
+        # ---------------------------------------------------------------
+        # Per-scale channel-attention interaction  (optional)
+        # ---------------------------------------------------------------
+        if use_interaction_block:
+            self.interaction_blocks = nn.ModuleList([
+                MultiScaleInteractionBlock(init_filters * 2 ** i) for i in range(n_scales)
+            ])
+            self.interaction_bottleneck = SemanticChangeInteractionBlock(
+                channels=bottleneck_ch,
+                num_heads=interaction_num_heads,
+                use_mamba=interaction_use_mamba,
+            )
+
+        # ---------------------------------------------------------------
+        # Skip-connection alignment  (1×1 conv per scale, per path)
+        # ---------------------------------------------------------------
+        self.skip_align_t1 = nn.ModuleList([
+            nn.Conv2d(init_filters * 2 ** i, init_filters * 2 ** i, 1, bias=False)
+            for i in range(n_scales)
+        ])
+        self.skip_align_t2 = nn.ModuleList([
+            nn.Conv2d(init_filters * 2 ** i, init_filters * 2 ** i, 1, bias=False)
+            for i in range(n_scales)
+        ])
+        self.skip_align_change = nn.ModuleList([
+            nn.Conv2d(init_filters * 2 ** i, init_filters * 2 ** i, 1, bias=False)
+            for i in range(n_scales)
+        ])
+
+        # ---------------------------------------------------------------
+        # Decoders  (one per output path + one for single-image mode)
+        # ---------------------------------------------------------------
+        def _make_decoder():
+            return SRCMDecoder(
+                spatial_dims, init_filters, blocks_up,
+                norm, act, up_conv_mode, self.upsample_mode,
+            )
+
+        self.decoder        = _make_decoder()   # single-image mode
+        self.decoder_t1     = _make_decoder()
+        self.decoder_t2     = _make_decoder()
+        self.decoder_change = _make_decoder()
+
+        # ---------------------------------------------------------------
+        # Prediction heads
+        # ---------------------------------------------------------------
+        def _seg_head():
+            return nn.Sequential(
+                get_norm_layer(name=norm, spatial_dims=spatial_dims, channels=init_filters),
+                act_mod,
+                get_conv_layer(spatial_dims, init_filters, num_classes, kernel_size=1, bias=True),
+            )
+
+        self.seg_head_t1 = _seg_head()
+        self.seg_head_t2 = _seg_head()
+
+        if use_change_head:
+            # 1-channel logit; trained with BCE+Dice, predicted via sigmoid.
+            # Single channel avoids the softmax-vs-sigmoid mismatch that arises
+            # when a 2-channel head is trained with binary targets.
+            self.change_head = nn.Sequential(
+                get_norm_layer(name=norm, spatial_dims=spatial_dims, channels=init_filters),
+                act_mod,
+                get_conv_layer(spatial_dims, init_filters, 1, kernel_size=1, bias=True),
+            )
+
+    # -------------------------------------------------------------------
+    # Private helpers
+    # -------------------------------------------------------------------
+
+    def _fuse_encoder_scales(
+        self,
+        skips1: list[torch.Tensor],
+        skips2: list[torch.Tensor],
+    ) -> tuple[list, list, list]:
+        """
+        At each encoder scale: CrossTemporalFusion → JointFeatureLearning →
+        (optional) MultiScaleInteraction.
+
+        Returns three parallel lists (shallow → deep):
+            skips1_enh, skips2_enh, skips_fused
+        """
+        skips1_enh, skips2_enh, skips_fused = [], [], []
+        for i, (f1, f2) in enumerate(zip(skips1, skips2)):
+            fused       = self.fuse_scales[i](f1, f2)
+            f1, f2, fused = self.joint_learning_scales[i](f1, f2, fused)
+            if self.use_interaction_block:
+                f1, f2, fused = self.interaction_blocks[i](f1, f2, fused)
+            skips1_enh.append(f1)
+            skips2_enh.append(f2)
+            skips_fused.append(fused)
+        return skips1_enh, skips2_enh, skips_fused
+
+    def _fuse_bottleneck(
+        self,
+        lat1: torch.Tensor,
+        lat2: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Fuse the two bottleneck feature maps with the same three-step pipeline
+        used at encoder scales, plus the more powerful SemanticChangeInteraction.
+
+        Returns enhanced (lat1, lat2, fused_latent).
+        """
+        fused          = self.fuse_bottleneck(lat1, lat2)
+        lat1, lat2, fused = self.joint_learning_bottleneck(lat1, lat2, fused)
+        if self.use_interaction_block:
+            lat1, lat2, fused = self.interaction_bottleneck(lat1, lat2, fused)
+        return lat1, lat2, fused
+
+    def _aligned_decoder_skips(
+        self,
+        skips: list[torch.Tensor],
+        align_modules: nn.ModuleList,
+    ) -> list[torch.Tensor]:
+        """
+        Apply per-scale 1×1 alignment convolutions and return the result in
+        deep → shallow order, excluding the deepest scale (which is the
+        bottleneck / latent and is passed separately to the decoder).
+        """
+        aligned = [align(skip) for align, skip in zip(align_modules, skips)]
+        # Drop the deepest scale (index -1) and reverse so decoder sees deep→shallow
+        return list(reversed(aligned[:-1]))
+
+    def _apply_change_gate(
+        self,
+        change_logits: torch.Tensor,
+        seg1: torch.Tensor,
+        seg2: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Modulate segmentation decoder features with the predicted change probability.
+
+        Additive mode:       feat * (1 + alpha * p)          amplifies changed regions
+        Multiplicative mode: feat * (beta + (1-beta) * p)    suppresses unchanged regions
+        """
+        p = torch.sigmoid(change_logits)   # [B, 1, H, W]
+        if p.shape[2:] != seg1.shape[2:]:
+            interp = "bilinear" if self.spatial_dims == 2 else "trilinear"
+            p = F.interpolate(p, size=seg1.shape[2:], mode=interp, align_corners=False)
+
+        if self.change_gate_mode == "additive":
+            seg1 = seg1 * (1.0 + self.change_gate_alpha * p)
+            seg2 = seg2 * (1.0 + self.change_gate_alpha * p)
+        else:   # multiplicative
+            gate = self.change_gate_beta + (1.0 - self.change_gate_beta) * p
+            seg1, seg2 = seg1 * gate, seg2 * gate
+
+        return seg1, seg2
+
+    # -------------------------------------------------------------------
+    # Forward pass
+    # -------------------------------------------------------------------
 
     def forward(self, x1: torch.Tensor, x2: torch.Tensor = None):
         """
-        Returns:
-            If x2 is None (single image mode):
-                seg_logits_t1: [B, num_classes, H, W] -- segmentation logits for T1
-            
-            If x2 is provided (change detection mode):
-                seg_logits_t1: [B, num_classes, H, W] -- segmentation logits for T1
-                seg_logits_t2: [B, num_classes, H, W] -- segmentation logits for T2
-                change_logits: [B, 2, H, W] -- change logits (if use_change_head=True)
+        Single-image mode  (x2 is None):
+            Returns: seg_logits_t1  [B, num_classes, H, W]
+
+        Change-detection mode  (x2 provided, use_change_head=True):
+            Returns: (seg_logits_t1, seg_logits_t2, change_logits)
+                seg_logits_t1/t2 : [B, num_classes, H, W]
+                change_logits    : [B, 1, H, W]
+
+        Change-detection mode  (x2 provided, use_change_head=False):
+            Returns: (seg_logits_t1, seg_logits_t2)
         """
-        # Single image segmentation mode
+        # ------------------------------------------------------------------ #
+        #  Single-image segmentation mode                                     #
+        # ------------------------------------------------------------------ #
         if x2 is None:
-            latent, down_x = self.encode(x1)
-            # ---- apply bottleneck context here ----
-            latent = self.context(latent)  
+            latent, skips = self.encoder(x1)
+            latent        = self.bottleneck(latent)
+            dec_skips     = list(reversed(skips[:-1]))          # deep → shallow, no bottleneck
+            dec           = self.decoder(latent, dec_skips)
+            return self.seg_head_t1(dec)
 
-            down_x.reverse()
-            dec = self._decode_with_layers(latent, down_x, self.up_samples, self.srcm_decoder_layers)
-            seg_logits_t1 = self.seg_head_t1(dec)
-            return seg_logits_t1
-            
-        # Change detection mode
-        else:
-            # Encode both images
-            x1_latent, down_x1 = self.encode(x1)
-            x2_latent, down_x2 = self.encode(x2)
-            
-            # Apply bottleneck context
-            x1_latent = self.context(x1_latent)
-            x2_latent = self.context(x2_latent)
-            
-            # Multi-scale joint feature learning with interaction
-            down_x_fused = []
-            down_x1_enhanced = []
-            down_x2_enhanced = []
-            
-            for i in range(len(down_x1)):
-                x1_i, x2_i = down_x1[i], down_x2[i]
-                
-                # Step 1: Initial fusion to create change features
-                fused_i = self.fuse_scales[i](x1_i, x2_i)
-                
-                # Step 2: Joint learning - change features influence semantic features
-                x1_i_enh, x2_i_enh, fused_i_enh = self.joint_learning_scales[i](x1_i, x2_i, fused_i)
-                
-                # Step 3: Multi-scale interaction between semantic and change
-                if self.use_interaction_block:
-                    x1_i_enh, x2_i_enh, fused_i_enh = self.interaction_blocks[i](
-                        x1_i_enh, x2_i_enh, fused_i_enh
-                    )
-                
-                down_x1_enhanced.append(x1_i_enh)
-                down_x2_enhanced.append(x2_i_enh)
-                down_x_fused.append(fused_i_enh)
-            
-            # Bottleneck: fusion + joint learning + interaction
-            fused_latent = self.fuse_bottleneck(x1_latent, x2_latent)
-            x1_latent, x2_latent, fused_latent = self.joint_learning_bottleneck(
-                x1_latent, x2_latent, fused_latent
-            )
-            
-            if self.use_interaction_block:
-                x1_latent, x2_latent, fused_latent = self.interaction_block_bottleneck(
-                    x1_latent, x2_latent, fused_latent
+        # ------------------------------------------------------------------ #
+        #  Change-detection mode                                              #
+        # ------------------------------------------------------------------ #
+
+        # 1. Encode both images with the shared encoder
+        lat1, skips1 = self.encoder(x1)
+        lat2, skips2 = self.encoder(x2)
+
+        # 2. Bottleneck context applied independently to each branch
+        lat1 = self.bottleneck(lat1)
+        lat2 = self.bottleneck(lat2)
+
+        # 3. Per-scale fusion: CrossTemporalFusion → JointLearning → Interaction
+        skips1_enh, skips2_enh, skips_fused = self._fuse_encoder_scales(skips1, skips2)
+
+        # 4. Bottleneck-level fusion + interaction
+        lat1, lat2, lat_fused = self._fuse_bottleneck(lat1, lat2)
+
+        # 5. Align skip connections for each decoder path (deep→shallow, no bottleneck)
+        t1_skips  = self._aligned_decoder_skips(skips1_enh,  self.skip_align_t1)
+        t2_skips  = self._aligned_decoder_skips(skips2_enh,  self.skip_align_t2)
+        chg_skips = self._aligned_decoder_skips(skips_fused, self.skip_align_change)
+
+        # 6. Decode each path independently
+        seg1_feats = self.decoder_t1(lat1,      t1_skips)
+        seg2_feats = self.decoder_t2(lat2,      t2_skips)
+
+        if self.use_change_head:
+            chg_feats     = self.decoder_change(lat_fused, chg_skips)
+            change_logits = self.change_head(chg_feats)
+
+            # 7. (Optional) change-guided gating of seg decoder features
+            if self.use_change_gating:
+                seg1_feats, seg2_feats = self._apply_change_gate(
+                    change_logits, seg1_feats, seg2_feats
                 )
-            
-            # Create aligned skip connections for all three paths
-            # This fixes the skip connection mismatch issue
-            down_x1_aligned = []
-            down_x2_aligned = []
-            down_x_change_aligned = []
-            
-            for i in range(len(down_x1_enhanced)):
-                # Use enhanced features as base, then create path-specific alignments
-                x1_skip = self.skip_align_t1[i](down_x1_enhanced[i])
-                x2_skip = self.skip_align_t2[i](down_x2_enhanced[i])
-                chg_skip = self.skip_align_change[i](down_x_fused[i])
-                
-                down_x1_aligned.append(x1_skip)
-                down_x2_aligned.append(x2_skip)
-                down_x_change_aligned.append(chg_skip)
-            
-            # Decode each path with aligned skip connections
-            down_x_change_aligned.reverse()
-            down_x1_aligned.reverse()
-            down_x2_aligned.reverse()
-            
-            # Decode for T1 and T2 (for segmentation) with aligned skip connections
-            seg1 = self._decode_with_layers(x1_latent, down_x1_aligned, self.up_samples_seg_t1, self.srcm_decoder_layers_seg_t1)
-            seg2 = self._decode_with_layers(x2_latent, down_x2_aligned, self.up_samples_seg_t2, self.srcm_decoder_layers_seg_t2)
-            
-            if self.use_change_head:
-                # Decode dedicated change path with aligned skip connections
-                chg_dec = self._decode_with_layers(fused_latent, down_x_change_aligned, self.up_samples_change, self.srcm_decoder_layers_change)
-                change_logits = self.change_head(chg_dec)
-                
-                # Change-guided gating: force semantic heads to focus on change-relevant regions
-                if self.use_change_gating:
-                    # 1-channel logit → sigmoid probability [B, 1, H, W]
-                    change_prob = torch.sigmoid(change_logits)
-                    
-                    # Resize change_prob to match decoder feature spatial size
-                    if change_prob.shape[2:] != seg1.shape[2:]:
-                        change_prob = F.interpolate(
-                            change_prob,
-                            size=seg1.shape[2:],
-                            mode='bilinear' if self.spatial_dims == 2 else 'trilinear',
-                            align_corners=False
-                        )
 
-                    # Apply gating to decoder features before segmentation heads
-                    if self.change_gate_mode == "additive":
-                        # Additive gating: dec_gated = dec * (1 + alpha * change_prob)
-                        seg1_gated = seg1 * (1.0 + self.change_gate_alpha * change_prob)
-                        seg2_gated = seg2 * (1.0 + self.change_gate_alpha * change_prob)
-                    else:  # multiplicative
-                        gate = self.change_gate_beta + (1.0 - self.change_gate_beta) * change_prob
-                        seg1_gated = seg1 * gate
-                        seg2_gated = seg2 * gate
-                    
-                    seg_logits_t1 = self.seg_head_t1(seg1_gated)
-                    seg_logits_t2 = self.seg_head_t2(seg2_gated)
-                else:
-                    seg_logits_t1 = self.seg_head_t1(seg1)
-                    seg_logits_t2 = self.seg_head_t2(seg2)
-                
-                return seg_logits_t1, seg_logits_t2, change_logits
-            else:
-                seg_logits_t1 = self.seg_head_t1(seg1)
-                seg_logits_t2 = self.seg_head_t2(seg2)
-                return seg_logits_t1, seg_logits_t2
+            return self.seg_head_t1(seg1_feats), self.seg_head_t2(seg2_feats), change_logits
+
+        return self.seg_head_t1(seg1_feats), self.seg_head_t2(seg2_feats)
+
 
 if __name__ == "__main__":
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -788,16 +790,16 @@ if __name__ == "__main__":
         blocks_up=(1, 1, 1),
     ).to(device)
 
-    # Test single image segmentation mode
-    x = torch.randn(1, 3, 256, 256).to(device)
-    seg = model(x)
-    print("Single image mode output shape:", seg.shape)
-    
-    # Test change detection mode
-    x1 = torch.randn(1, 3, 256, 256).to(device)
-    x2 = torch.randn(1, 3, 256, 256).to(device)
-    seg_t1, seg_t2, change = model(x1, x2)
-    print("Change detection mode output shapes:")
+    # Single-image segmentation mode
+    seg = model(torch.randn(1, 3, 256, 256).to(device))
+    print("Single-image mode output shape:", seg.shape)
+
+    # Change-detection mode
+    seg_t1, seg_t2, change = model(
+        torch.randn(1, 3, 256, 256).to(device),
+        torch.randn(1, 3, 256, 256).to(device),
+    )
+    print("Change-detection mode:")
     print(f"  Segmentation T1: {seg_t1.shape}")
     print(f"  Segmentation T2: {seg_t2.shape}")
-    print(f"  Change map: {change.shape}")
+    print(f"  Change map:      {change.shape}")
