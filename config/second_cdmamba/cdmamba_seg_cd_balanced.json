@@ -22,7 +22,7 @@
       "datasetroot": "/root/home/pvc/mcd_dataset/SECOND/train",
       "resolution": 512,
       "phase": "train",
-      "batch_size": 4,
+      "batch_size": 2,
       "num_workers": 4,
       "use_shuffle": true,
       "data_len": -1
@@ -32,7 +32,7 @@
       "datasetroot": "/root/home/pvc/mcd_dataset/SECOND/val",
       "resolution": 512,
       "phase": "val",
-      "batch_size": 4,
+      "batch_size": 2,
       "num_workers": 4,
       "data_len": -1
     },
