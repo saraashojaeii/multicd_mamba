@@ -26,7 +26,7 @@ class ConvPosEnc(nn.Module):
 class CrossTemporalFusion(nn.Module):
     """
     Multi-scale feature differencing fusion:
-    concat(F1, F2, |F2-F1|, F2-F1) -> 1x1 conv reduce -> 3x3 conv refine.
+    concat(F1, F2, |F2-F1|, F2-F1) -> 1x1 conv reduce -> dilated 3x3 conv refine (dilation=2).
     Output channels match input feature channels (C).
     """
     def __init__(self, channels: int):
@@ -36,7 +36,7 @@ class CrossTemporalFusion(nn.Module):
             nn.Conv2d(in_ch, channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(channels),
             nn.ReLU(inplace=True),
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=2, dilation=2, bias=False),
             nn.BatchNorm2d(channels),
             nn.ReLU(inplace=True),
         )

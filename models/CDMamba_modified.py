@@ -39,19 +39,21 @@ class ModifiedSRCMLayer(nn.Module):
         ])
 
         self.gate_proj = nn.Linear(input_dim, input_dim)
-        self.pos_embed = nn.Parameter(torch.randn(1, 4096, input_dim))  # Max 32x32 tokens (safe default)
+        self.coord_embed = nn.Sequential(
+            nn.Linear(2, input_dim),
+            nn.GELU(),
+            nn.Linear(input_dim, input_dim),
+        )
         self.proj = nn.Linear(input_dim, output_dim)
 
     def forward(self, x):
         B, C, H, W = x.shape
         x = x.reshape(B, C, -1).transpose(1, 2)  # [B, N, C]
-        pos_embed = F.interpolate(
-            self.pos_embed.transpose(1, 2).reshape(1, self.input_dim, int(self.pos_embed.shape[1] ** 0.5), -1),
-            size=(H, W),
-            mode='bilinear',
-            align_corners=False
-        ).reshape(1, self.input_dim, -1).transpose(1, 2)  # Shape: [1, H*W, C]
-        x = x + pos_embed[:, :x.shape[1], :]
+        ys = torch.linspace(0, 1, H, device=x.device, dtype=x.dtype)
+        xs = torch.linspace(0, 1, W, device=x.device, dtype=x.dtype)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')
+        coords = torch.stack([grid_y, grid_x], dim=-1).reshape(1, H * W, 2)  # [1, HW, 2]
+        x = x + self.coord_embed(coords)                                      # [1, HW, C] → broadcasts over B
 
         x_norm = self.norm(x)
 

@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import kornia
 from torch import Tensor, einsum
 from misc.torchutils import class2one_hot,simplex
 from models.darnet_help.loss_help import FocalLoss, dernet_dice_loss
@@ -546,7 +547,8 @@ class TripletChangeSegLoss(nn.Module):
                  min_changed_threshold: int = 10,
                  enable_changed_only_supervision: bool = True,
                  enable_unch_conf_gating: bool = True,
-                 enable_pseudo_labeling: bool = True):
+                 enable_pseudo_labeling: bool = True,
+                 lambda_boundary: float = 0.5):
         super().__init__()
         self.seg_loss_fn = seg_loss_fn
         self.cd_loss = ChangeHeadBCEDiceLoss(lambda_dice=1.0)
@@ -571,6 +573,8 @@ class TripletChangeSegLoss(nn.Module):
         self.min_changed_threshold = min_changed_threshold
         self.eps = 1e-8
         
+        self.lam_boundary = lambda_boundary
+
         # Ablation switches
         self.enable_changed_only_supervision = enable_changed_only_supervision
         self.enable_unch_conf_gating = enable_unch_conf_gating
@@ -695,6 +699,11 @@ class TripletChangeSegLoss(nn.Module):
                 
                 L_pseudo = loss_pseudo_t1 + loss_pseudo_t2
 
+        # Boundary-aware BCE loss: upweight BCE along GT change mask edges
+        boundary_gt = kornia.filters.laplacian(c.float(), kernel_size=3).abs().clamp(0, 1)
+        bce_boundary = F.binary_cross_entropy_with_logits(u, c.float(), reduction='none')
+        L_boundary = (bce_boundary * boundary_gt).sum() / (boundary_gt.sum() + self.eps)
+
         # Guard numerics
         L_seg  = torch.nan_to_num(L_seg,  nan=0.0, posinf=1e4, neginf=0.0)
         L_cd   = torch.nan_to_num(L_cd,   nan=0.0, posinf=1e4, neginf=0.0)
@@ -702,13 +711,15 @@ class TripletChangeSegLoss(nn.Module):
         L_ch   = torch.nan_to_num(L_ch,   nan=0.0, posinf=1e4, neginf=0.0)
         L_cpl  = torch.nan_to_num(L_cpl,  nan=0.0, posinf=1e4, neginf=0.0)
         L_pseudo = torch.nan_to_num(L_pseudo, nan=0.0, posinf=1e4, neginf=0.0)
+        L_boundary = torch.nan_to_num(L_boundary, nan=0.0, posinf=1e4, neginf=0.0)
 
         total = (self.lam_seg * L_seg +
                  self.lam_cd  * L_cd  +
                  self.lam_unch* L_unch+
                  self.lam_ch  * L_ch  +
                  self.lam_cpl * L_cpl +
-                 self.lam_pseudo * L_pseudo)
+                 self.lam_pseudo * L_pseudo +
+                 self.lam_boundary * L_boundary)
 
         return total, {
             "seg": L_seg.item(),
@@ -718,7 +729,8 @@ class TripletChangeSegLoss(nn.Module):
             "unch_kl": L_unch.item(),
             "ch_div": L_ch.item(),
             "couple": L_cpl.item(),
-            "pseudo_unch": L_pseudo.item()
+            "pseudo_unch": L_pseudo.item(),
+            "boundary": L_boundary.item()
         }
 
 

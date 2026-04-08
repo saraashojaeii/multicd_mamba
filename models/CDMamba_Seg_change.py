@@ -62,7 +62,8 @@ class ModifiedSRCMLayer(nn.Module):
 
     Pipeline:
       1. Depthwise-conv positional encoding
-      2. Flatten H×W → token sequence, add learned 2-D position embeddings
+      2. Flatten H×W → token sequence, add coordinate-conditioned position embeddings
+         (normalised (i/H, j/W) grid → 2-layer MLP → C dims; works at any resolution)
       3. Grouped bi-directional Mamba (each of G groups processes C/G channels)
       4. Gated residual: sigmoid(gate) * mamba_out + (1-gate) * input
       5. Linear projection to output_dim
@@ -82,7 +83,11 @@ class ModifiedSRCMLayer(nn.Module):
         ])
         self.gate_proj = nn.Linear(input_dim, input_dim)
         self.pos_enc   = ConvPosEnc(input_dim)
-        self.pos_embed = nn.Parameter(torch.randn(1, 4096, input_dim))  # max 64×64 tokens
+        self.coord_embed = nn.Sequential(
+            nn.Linear(2, input_dim),
+            nn.GELU(),
+            nn.Linear(input_dim, input_dim),
+        )
         self.proj      = nn.Linear(input_dim, output_dim)
 
     def forward(self, x):
@@ -90,12 +95,11 @@ class ModifiedSRCMLayer(nn.Module):
         x = self.pos_enc(x)
         x = x.reshape(B, C, -1).transpose(1, 2)                          # [B, HW, C]
 
-        pos = F.interpolate(
-            self.pos_embed.transpose(1, 2).reshape(
-                1, self.input_dim, int(self.pos_embed.shape[1] ** 0.5), -1),
-            size=(H, W), mode='bilinear', align_corners=False,
-        ).reshape(1, self.input_dim, -1).transpose(1, 2)                  # [1, HW, C]
-        x = x + pos[:, :x.shape[1], :]
+        ys = torch.linspace(0, 1, H, device=x.device, dtype=x.dtype)
+        xs = torch.linspace(0, 1, W, device=x.device, dtype=x.dtype)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')
+        coords = torch.stack([grid_y, grid_x], dim=-1).reshape(1, H * W, 2)  # [1, HW, 2]
+        x = x + self.coord_embed(coords)                                      # [1, HW, C] → broadcasts over B
 
         x_norm  = self.norm(x)
         chunks  = x_norm.chunk(self.groups, dim=-1)
@@ -256,7 +260,8 @@ class CrossTemporalFusion(nn.Module):
     Multi-cue differencing fusion at one encoder scale.
 
     Concatenates [F1, F2, |F2-F1|, F2-F1] (4C channels) and reduces back to C
-    via a 1×1 conv (channel reduction) followed by a 3×3 conv (spatial refinement).
+    via a 1×1 conv (channel reduction) followed by a dilated 3×3 conv (dilation=2)
+    for spatial refinement with a wider receptive field and sharp boundary signals.
 
     Input : two feature maps F1, F2  each [B, C, H, W]
     Output: fused change features         [B, C, H, W]
@@ -266,7 +271,7 @@ class CrossTemporalFusion(nn.Module):
         self.fuse = nn.Sequential(
             nn.Conv2d(channels * 4, channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(channels), nn.ReLU(inplace=True),
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=2, dilation=2, bias=False),
             nn.BatchNorm2d(channels), nn.ReLU(inplace=True),
         )
 
