@@ -216,7 +216,7 @@ class SRCMDecoder(nn.Module):
     skips_deep_to_shallow: encoder skips ordered deep → shallow, excluding the
                            bottleneck (deepest) scale which is the latent itself.
     """
-    def __init__(self, spatial_dims, init_filters, blocks_up, norm, act,
+    def __init__(self, spatial_dims, bottleneck_ch, blocks_up, norm, act,
                  up_conv_mode, upsample_mode):
         super().__init__()
         self.spatial_dims = spatial_dims
@@ -224,8 +224,8 @@ class SRCMDecoder(nn.Module):
 
         up_samples, layers = [], []
         for i in range(n_up):
-            in_ch  = init_filters * 2 ** (n_up - i)   # e.g. 128 → 64 → 32
-            out_ch = in_ch // 2                        # e.g.  64 → 32 → 16
+            in_ch  = bottleneck_ch // (2 ** i)   # starts at bottleneck, halves each step
+            out_ch = in_ch // 2
             up_samples.append(nn.Sequential(
                 get_conv_layer(spatial_dims, in_ch, out_ch, kernel_size=1),
                 get_upsample_layer(spatial_dims, out_ch, upsample_mode=upsample_mode),
@@ -597,7 +597,7 @@ class CDMamba_seg_cd(nn.Module):
         # ---------------------------------------------------------------
         def _make_decoder():
             return SRCMDecoder(
-                spatial_dims, init_filters, blocks_up,
+                spatial_dims, bottleneck_ch, blocks_up,
                 norm, act, up_conv_mode, self.upsample_mode,
             )
 
