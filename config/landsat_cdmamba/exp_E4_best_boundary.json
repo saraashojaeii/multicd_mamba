@@ -5,7 +5,7 @@
   "gpu_ids": [0],
 
   "wandb": {
-    "project": "scd-balanced-mamba"
+    "project": "mcd-summer2026-landsat-train"
   },
 
   "colormap": [[255, 255, 255], [0, 155, 0], [255, 165, 0], [230, 30, 100], [0, 170, 240]],

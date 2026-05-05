@@ -5,7 +5,7 @@
   "gpu_ids": [0],
 
   "wandb": {
-    "project": "scd-balanced-mamba"
+    "project": "mcd-summer2026-second-train"
   },
 
   "colormap": [[255, 255, 255], [0, 0, 255], [128, 128, 128], [0, 128, 0], [0, 255, 0], [128, 0, 0], [255, 0, 0]],

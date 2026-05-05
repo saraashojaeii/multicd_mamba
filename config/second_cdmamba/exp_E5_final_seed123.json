@@ -1,11 +1,11 @@
 {
-  "
+  "_comment": "E5 seed 123: final paper run on SECOND. Copy best boundary config from E1-E3 here before running.",
   "name": "exp_E5_second_final_seed123",
   "phase": "train",
   "gpu_ids": [0],
 
   "wandb": {
-    "project": "scd-balanced-mamba"
+    "project": "mcd-summer2026-second-train"
   },
 
   "colormap": [[255, 255, 255], [0, 0, 255], [128, 128, 128], [0, 128, 0], [0, 255, 0], [128, 0, 0], [255, 0, 0]],
