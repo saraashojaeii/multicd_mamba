@@ -1,92 +1,89 @@
 {
-  "name": "cdmamba_seg_cd_balanced",
+  "
+  "name": "exp_E5_second_final_seed123",
   "phase": "train",
   "gpu_ids": [0],
-  
+
   "wandb": {
     "project": "scd-balanced-mamba"
   },
 
-  "colormap": [[255, 255, 255], [0, 155, 0], [255, 165, 0], [230, 30, 100], [0, 170, 240]],
+  "colormap": [[255, 255, 255], [0, 0, 255], [128, 128, 128], [0, 128, 0], [0, 255, 0], [128, 0, 0], [255, 0, 0]],
 
   "path_cd": {
-    "log": "/root/home/pvc/01_change_detection/Building_changedetection_job/experiments/logs",
-    "result": "/root/home/pvc/01_change_detection/Building_changedetection_job/experiments/results",
-    "checkpoint": "/root/home/pvc/01_change_detection/Building_changedetection_job/experiments/checkpoint",
-    "resume_state": null  
+    "log": "/root/home/pvc/mcd_dataset/SECOND/experiments/logs",
+    "result": "/root/home/pvc/mcd_dataset/SECOND/experiments/results",
+    "checkpoint": "/root/home/pvc/mcd_dataset/SECOND/checkpoint",
+    "resume_state": null
   },
-  
+
   "datasets": {
     "train": {
-      "name": "Landsat",
-      "datasetroot": "/root/home/pvc/01_change_detection/00_multiclass_datasets/Landsat/train",
-      "resolution": 416,
+      "name": "SECOND",
+      "datasetroot": "/root/home/pvc/mcd_dataset/SECOND/train",
+      "resolution": 512,
       "phase": "train",
-      "batch_size": 2,
+      "batch_size": 1,
       "num_workers": 4,
       "use_shuffle": true,
       "data_len": -1
     },
     "val": {
-      "name": "Landsat",
-      "datasetroot": "/root/home/pvc/01_change_detection/00_multiclass_datasets/Landsat/val",
-      "resolution": 416,
+      "name": "SECOND",
+      "datasetroot": "/root/home/pvc/mcd_dataset/SECOND/val",
+      "resolution": 512,
       "phase": "val",
-      "batch_size": 2,
+      "batch_size": 1,
       "num_workers": 4,
       "data_len": -1
     },
     "test": {
-      "name": "Landsat",
-      "datasetroot": "/root/home/pvc/01_change_detection/00_multiclass_datasets/Landsat/test",
-      "resolution": 416,
+      "name": "SECOND",
+      "datasetroot": "/root/home/pvc/mcd_dataset/SECOND/test",
+      "resolution": 512,
       "phase": "test",
       "batch_size": 1,
       "num_workers": 1,
       "data_len": -1
     }
   },
-  
+
   "model": {
     "name": "cdmamba_seg_cd",
     "loss": "extended_triplet",
     "extended_triplet": {
       "seg_loss": "weighted_ce_dice",
-      "lambda_seg": 1.5,
-      "lambda_cd": 1.0,
-      "lambda_unch": 0.7,
-      "lambda_ch": 0.2,
-      "lambda_cpl": 0.3,
-      "lambda_pseudo": 0.5,
+      "lambda_seg": 1.0,
+      "lambda_cd": 0.8,
+      "lambda_unch": 0.1,
+      "lambda_ch": 0.3,
+      "lambda_cpl": 0.2,
+      "lambda_pseudo": 0.3,
       "boost": 5.0,
       "T": 4.0,
       "margin": 0.3,
-      
-      "_comment_seg_masking": "Segmentation supervision strategy",
-      "seg_mask_mode": "changed_only",
+
+      "seg_mask_mode": "mixed",
       "min_changed_threshold": 10,
-      
-      "_comment_unch_kl": "Unchanged KL loss with confidence gating",
+
       "use_conf_gate": true,
       "conf_tau": 0.9,
       "conf_method": "max_prob",
-      "kl_warmup_epochs": 20,
-      
-      "_comment_pseudo": "Pseudo-labeling on unchanged pixels",
+      "kl_warmup_epochs": 30,
+
       "use_pseudo_labeling": true,
       "pseudo_conf_tau": 0.9,
-      
-      "_comment_ablation": "Ablation switches - set to false to disable features",
-      "enable_changed_only_supervision": true,
+
+      "enable_changed_only_supervision": false,
       "enable_unch_conf_gating": true,
       "enable_kl_warmup": true,
       "enable_pseudo_labeling": true,
 
-      "_comment_boundary": "Boundary losses: laplacian (always on), morph+hausdorff off by default",
+      "
       "lambda_boundary": 0.5,
-      "lambda_morph_boundary": 0.0,
+      "lambda_morph_boundary": 0.5,
       "lambda_hausdorff": 0.0,
-      "enable_boundary_warmup": false,
+      "enable_boundary_warmup": true,
       "boundary_warmup_epochs": 20
     },
     "use_change_head": true,
@@ -97,8 +94,8 @@
     "use_interaction_block": true,
     "interaction_num_heads": 4,
     "interaction_use_mamba": false,
-    "init_filters": 16,
-    "n_classes": 5,
+    "init_filters": 32,
+    "n_classes": 7,
     "conv_mode": "deepwise",
     "up_conv_mode": "deepwise",
     "spatial_dims": 2,
@@ -108,7 +105,7 @@
     "blocks_up": [1, 1, 1],
     "norm": ["GROUP", {"num_groups": 8}]
   },
-  
+
   "train": {
     "n_epoch": 200,
     "val_freq": 1,
@@ -116,23 +113,23 @@
     "save_checkpoint_freq": 5,
     "ignore_index": 255,
     "grad_accum": 2,
-    
+
     "optimizer": {
       "type": "adamW",
-      "lr": 0.0001,
+      "lr": 0.00005,
       "weight_decay": 0.0001,
       "beta1": 0.9,
       "beta2": 0.999,
-      "eta_min": 1e-6
+      "eta_min": 5e-7
     },
-    
+
     "use_balanced_sampler": true,
     "balanced_sampler": {
       "change_threshold": 0.01,
-      "rare_classes": [],
+      "rare_classes": [3, 5],
       "oversample_factor": 2.0,
       "precompute_stats": true,
-      "stats_file": "config/landsat_cdmamba/sampler_stats/train_train_sampler_stats.json",
+      "stats_file": "config/second_cdmamba/sampler_stats/train_train_sampler_stats.json",
       "batch_balance_ratio": 0.5,
       "use_batch_balance": true,
       "epoch_schedule_oversample": true,

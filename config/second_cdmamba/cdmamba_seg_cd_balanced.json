@@ -80,7 +80,14 @@
       "enable_changed_only_supervision": false,
       "enable_unch_conf_gating": true,
       "enable_kl_warmup": true,
-      "enable_pseudo_labeling": true
+      "enable_pseudo_labeling": true,
+
+      "_comment_boundary": "Boundary losses: laplacian (always on), morph+hausdorff off by default",
+      "lambda_boundary": 0.5,
+      "lambda_morph_boundary": 0.0,
+      "lambda_hausdorff": 0.0,
+      "enable_boundary_warmup": false,
+      "boundary_warmup_epochs": 20
     },
     "use_change_head": true,
     "use_change_gating": true,

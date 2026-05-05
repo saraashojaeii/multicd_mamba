@@ -397,6 +397,76 @@ class ChangeHeadBCEDiceLoss(nn.Module):
         dice = self.dice(change_logits, change_gt)
         return bce + self.lambda_dice * dice
 
+
+class ChangeHeadMorphBoundaryLoss(nn.Module):
+    """Boundary-aware BCE using a morphological dilation-erosion ring.
+
+    Computes a thick boundary ring around the GT change mask via dilation minus
+    erosion, then up-weights BCE loss at those boundary pixels.  Uses a wider
+    ring than the Laplacian approach (radius=3 → ~7-pixel ring) so the model
+    gets stronger gradient signal to sharpen change-mask edges.
+
+    Args:
+        dilation_radius: half-size of the square structuring element (pixels).
+        boundary_weight:  extra weight multiplier at boundary pixels (total
+                          pixel weight = 1 + boundary_weight * boundary_ring).
+    """
+    def __init__(self, dilation_radius: int = 3, boundary_weight: float = 3.0):
+        super().__init__()
+        self.dilation_radius = int(dilation_radius)
+        self.boundary_weight = float(boundary_weight)
+
+    def forward(self, change_logits: torch.Tensor, change_gt: torch.Tensor) -> torch.Tensor:
+        if change_gt.dim() == 3:
+            change_gt = change_gt.unsqueeze(1)
+        change_logits = _resize_like(change_logits, change_gt)
+        gt_float = change_gt.float()
+
+        k = 2 * self.dilation_radius + 1
+        kernel = torch.ones(k, k, device=gt_float.device, dtype=gt_float.dtype)
+        dilated = kornia.morphology.dilation(gt_float, kernel)
+        eroded  = kornia.morphology.erosion(gt_float, kernel)
+        boundary_ring = (dilated - eroded).clamp(0.0, 1.0)  # [B, 1, H, W]
+
+        pixel_weights = 1.0 + self.boundary_weight * boundary_ring
+        bce = F.binary_cross_entropy_with_logits(change_logits, gt_float, reduction='none')
+        return (bce * pixel_weights).mean()
+
+
+class ChangeHeadHausdorffLoss(nn.Module):
+    """Hausdorff distance-transform loss for change-mask boundary refinement.
+
+    Uses MONAI's HausdorffDTLoss which internally computes distance transforms
+    of both prediction and GT, strongly penalising predictions that are spatially
+    far from the true boundary.  Falls back to zero if MONAI is unavailable.
+
+    The change head output is sigmoid-activated and cast to a 2-channel
+    (no-change / change) representation expected by HausdorffDTLoss.
+    """
+    def __init__(self):
+        super().__init__()
+        self._loss_fn = None
+        self._available = False
+        try:
+            from monai.losses import HausdorffDTLoss as _HDT
+            # include_background=False: only penalise the foreground (change) class
+            self._loss_fn = _HDT(include_background=False, reduction="mean", batch=True)
+            self._available = True
+        except Exception:
+            pass  # MONAI not installed; loss returns 0
+
+    def forward(self, change_logits: torch.Tensor, change_gt: torch.Tensor) -> torch.Tensor:
+        if not self._available:
+            return change_logits.new_tensor(0.0)
+        if change_gt.dim() == 3:
+            change_gt = change_gt.unsqueeze(1)
+        change_logits = _resize_like(change_logits, change_gt)
+        prob = torch.sigmoid(change_logits)                        # [B, 1, H, W]
+        prob_2c = torch.cat([1.0 - prob, prob], dim=1)            # [B, 2, H, W]
+        gt_2c   = torch.cat([1.0 - change_gt.float(),
+                              change_gt.float()], dim=1)           # [B, 2, H, W]
+        return self._loss_fn(prob_2c, gt_2c)
+
 class UnchangedSymmetricKLLoss(nn.Module):
     """Symmetric KL between t1/t2 class distributions on UNCHANGED pixels (c==0).
     Inputs are logits for numerical stability; temperature T softens distributions.
@@ -548,17 +618,23 @@ class TripletChangeSegLoss(nn.Module):
                  enable_changed_only_supervision: bool = True,
                  enable_unch_conf_gating: bool = True,
                  enable_pseudo_labeling: bool = True,
-                 lambda_boundary: float = 0.5):
+                 lambda_boundary: float = 0.5,
+                 lambda_morph_boundary: float = 0.0,
+                 lambda_hausdorff: float = 0.0):
         super().__init__()
         self.seg_loss_fn = seg_loss_fn
         self.cd_loss = ChangeHeadBCEDiceLoss(lambda_dice=1.0)
-        
+
         # Apply ablation switch for unchanged confidence gating
         use_conf_gate_effective = use_conf_gate and enable_unch_conf_gating
         self.unch_kl = UnchangedSymmetricKLLoss(T=T, use_conf_gate=use_conf_gate_effective, tau=conf_tau, conf_method=conf_method)
-        
+
         self.ch_div = ChangedDiversityCosineMarginLoss(margin=margin)
         self.couple = CouplingChangeSemanticLoss(distance="l1")
+
+        # Boundary refinement losses
+        self.morph_boundary_loss = ChangeHeadMorphBoundaryLoss()
+        self.hausdorff_loss = ChangeHeadHausdorffLoss()
 
         self.lam_seg = lambda_seg
         self.lam_cd = lambda_cd
@@ -572,14 +648,16 @@ class TripletChangeSegLoss(nn.Module):
         self.seg_mask_mode = seg_mask_mode
         self.min_changed_threshold = min_changed_threshold
         self.eps = 1e-8
-        
+
         self.lam_boundary = lambda_boundary
+        self.lam_morph_boundary = float(lambda_morph_boundary)
+        self.lam_hausdorff = float(lambda_hausdorff)
 
         # Ablation switches
         self.enable_changed_only_supervision = enable_changed_only_supervision
         self.enable_unch_conf_gating = enable_unch_conf_gating
         self.enable_pseudo_labeling = enable_pseudo_labeling
-        
+
         # Transition weights [C, C] for rebalancing changed pixels
         self.register_buffer('transition_weights', transition_weights if transition_weights is not None else None)
 
@@ -699,38 +777,54 @@ class TripletChangeSegLoss(nn.Module):
                 
                 L_pseudo = loss_pseudo_t1 + loss_pseudo_t2
 
-        # Boundary-aware BCE loss: upweight BCE along GT change mask edges
+        # Laplacian boundary-aware BCE: upweight BCE along the thin GT change edge
         boundary_gt = kornia.filters.laplacian(c.float(), kernel_size=3).abs().clamp(0, 1)
         bce_boundary = F.binary_cross_entropy_with_logits(u, c.float(), reduction='none')
         L_boundary = (bce_boundary * boundary_gt).sum() / (boundary_gt.sum() + self.eps)
 
-        # Guard numerics
-        L_seg  = torch.nan_to_num(L_seg,  nan=0.0, posinf=1e4, neginf=0.0)
-        L_cd   = torch.nan_to_num(L_cd,   nan=0.0, posinf=1e4, neginf=0.0)
-        L_unch = torch.nan_to_num(L_unch, nan=0.0, posinf=1e4, neginf=0.0)
-        L_ch   = torch.nan_to_num(L_ch,   nan=0.0, posinf=1e4, neginf=0.0)
-        L_cpl  = torch.nan_to_num(L_cpl,  nan=0.0, posinf=1e4, neginf=0.0)
-        L_pseudo = torch.nan_to_num(L_pseudo, nan=0.0, posinf=1e4, neginf=0.0)
-        L_boundary = torch.nan_to_num(L_boundary, nan=0.0, posinf=1e4, neginf=0.0)
+        # Morphological boundary loss: thicker dilation-erosion ring around change edges
+        L_morph_boundary = torch.zeros([], device=z1.device, dtype=z1.dtype)
+        if self.lam_morph_boundary > 0:
+            L_morph_boundary = self.morph_boundary_loss(u, c)
 
-        total = (self.lam_seg * L_seg +
-                 self.lam_cd  * L_cd  +
-                 self.lam_unch* L_unch+
-                 self.lam_ch  * L_ch  +
-                 self.lam_cpl * L_cpl +
-                 self.lam_pseudo * L_pseudo +
-                 self.lam_boundary * L_boundary)
+        # Hausdorff distance-transform loss: penalises spatial distance to true boundary
+        L_hausdorff = torch.zeros([], device=z1.device, dtype=z1.dtype)
+        if self.lam_hausdorff > 0:
+            L_hausdorff = self.hausdorff_loss(u, c)
+
+        # Guard numerics
+        L_seg          = torch.nan_to_num(L_seg,          nan=0.0, posinf=1e4, neginf=0.0)
+        L_cd           = torch.nan_to_num(L_cd,           nan=0.0, posinf=1e4, neginf=0.0)
+        L_unch         = torch.nan_to_num(L_unch,         nan=0.0, posinf=1e4, neginf=0.0)
+        L_ch           = torch.nan_to_num(L_ch,           nan=0.0, posinf=1e4, neginf=0.0)
+        L_cpl          = torch.nan_to_num(L_cpl,          nan=0.0, posinf=1e4, neginf=0.0)
+        L_pseudo       = torch.nan_to_num(L_pseudo,       nan=0.0, posinf=1e4, neginf=0.0)
+        L_boundary     = torch.nan_to_num(L_boundary,     nan=0.0, posinf=1e4, neginf=0.0)
+        L_morph_boundary = torch.nan_to_num(L_morph_boundary, nan=0.0, posinf=1e4, neginf=0.0)
+        L_hausdorff    = torch.nan_to_num(L_hausdorff,    nan=0.0, posinf=1e4, neginf=0.0)
+
+        total = (self.lam_seg            * L_seg            +
+                 self.lam_cd             * L_cd             +
+                 self.lam_unch           * L_unch           +
+                 self.lam_ch             * L_ch             +
+                 self.lam_cpl            * L_cpl            +
+                 self.lam_pseudo         * L_pseudo         +
+                 self.lam_boundary       * L_boundary       +
+                 self.lam_morph_boundary * L_morph_boundary +
+                 self.lam_hausdorff      * L_hausdorff)
 
         return total, {
-            "seg": L_seg.item(),
-            "seg_t1": L_t1.item(),
-            "seg_t2": L_t2.item(),
-            "cd": L_cd.item(),
-            "unch_kl": L_unch.item(),
-            "ch_div": L_ch.item(),
-            "couple": L_cpl.item(),
-            "pseudo_unch": L_pseudo.item(),
-            "boundary": L_boundary.item()
+            "seg":            L_seg.item(),
+            "seg_t1":         L_t1.item(),
+            "seg_t2":         L_t2.item(),
+            "cd":             L_cd.item(),
+            "unch_kl":        L_unch.item(),
+            "ch_div":         L_ch.item(),
+            "couple":         L_cpl.item(),
+            "pseudo_unch":    L_pseudo.item(),
+            "boundary":       L_boundary.item(),
+            "morph_boundary": L_morph_boundary.item(),
+            "hausdorff":      L_hausdorff.item(),
         }
 
 

@@ -383,6 +383,9 @@ def main():
             enable_changed_only_supervision=cfg.get('enable_changed_only_supervision', True),
             enable_unch_conf_gating=cfg.get('enable_unch_conf_gating', True),
             enable_pseudo_labeling=cfg.get('enable_pseudo_labeling', True),
+            lambda_boundary=cfg.get('lambda_boundary', 0.5),
+            lambda_morph_boundary=cfg.get('lambda_morph_boundary', 0.0),
+            lambda_hausdorff=cfg.get('lambda_hausdorff', 0.0),
         ).to(device)
         loss_fun_change = loss_fun
         
@@ -591,6 +594,18 @@ def main():
                     loss_fun.lam_unch = base_lambda_unch * kl_ramp
                     if epoch < kl_warmup_epochs:
                         logger.info(f"[Epoch {epoch}] KL warmup ramp: {kl_ramp:.3f}, lambda_unch: {loss_fun.lam_unch:.4f}")
+
+            # Boundary loss warmup: hold morph_boundary / hausdorff at 0 until epoch N
+            if loss_type == 'extended_triplet':
+                enable_boundary_warmup = cfg.get('enable_boundary_warmup', False)
+                if enable_boundary_warmup:
+                    boundary_warmup_epochs = cfg.get('boundary_warmup_epochs', 20)
+                    if epoch < boundary_warmup_epochs:
+                        loss_fun.lam_morph_boundary = 0.0
+                        loss_fun.lam_hausdorff = 0.0
+                    else:
+                        loss_fun.lam_morph_boundary = cfg.get('lambda_morph_boundary', 0.0)
+                        loss_fun.lam_hausdorff = cfg.get('lambda_hausdorff', 0.0)
                 else:
                     # No warmup: use base value directly
                     loss_fun.lam_unch = base_lambda_unch
